@@ -21,7 +21,7 @@ Commercial in-house legal AI products treat their prompt engineering as propriet
 
 LQ.AI inverts this. **Every artifact that shapes the user's experience is visible work product.** The skills are open source. The playbooks are open source. The citation engine's verification logic is open source. The Enhance Prompt rewriter is open source. The Organization Profile that captures org-wide voice is open source. When a user clicks "view this skill" on any active skill, they see the actual `SKILL.md` and supporting files, formatted for human reading, with provenance and the ability to fork.
 
-The position implied by all of this is uncomfortable for the rest of the legal-AI category, and that is intentional. Customers who have been paying for software whose only real innovation is a hidden system prompt are entitled to see what they have actually been buying. When the curtain is pulled back, some products will hold up. Many will not. LQ.AI's bet is that an open, transparent product built on community-curated skills is better than a closed, opaque product built on the assumption that the user cannot see what is happening — and that the resulting trust is worth more than the marketing.
+The position implied by all of this is uncomfortable for the rest of the legal-AI category, and that is intentional. Customers who have been paying for software whose only real innovation is a hidden system prompt are entitled to see what they have actually been buying. When the curtain is pulled back, some products will hold up. Many will not. LQ.AI's bet is that an open, transparent product built on community-curated skills is better than a closed, opaque product built on the assumption that the user cannot see what is happening — and that the resulting trust is worth more than the  
 
 For more on this philosophy, see [PRD §1.3 Transparency as a Founding Principle](docs/PRD.md#13-transparency-as-a-founding-principle) and [§7.1 Project Philosophy](docs/PRD.md#71-project-philosophy).
 
@@ -187,8 +187,8 @@ docker compose ps   # all 7 services should show "healthy" or "running"
 
 ```bash
 docker exec -w /app lq-ai-api-1 python -m app.cli reset-admin-password \
-  --email admin@lq.ai \
-  --password 'LQ-AI-smoke-test-Pw1!' \
+  --email mark.kay@telus.com \
+  --password 'Er1n2lexis2026!' \
   --no-force-change
 ```
 
@@ -200,8 +200,8 @@ This sets a known password for the bootstrap admin account so you can log in imm
 
 Navigate to `http://localhost:3000/lq-ai/login` and sign in:
 
-- **Email:** `admin@lq.ai`
-- **Password:** `LQ-AI-smoke-test-Pw1!` (or whatever you set in step 3)
+- **Email:** `mark.kay@telus.com`
+- **Password:** `Er1n2lexis2026!` (or whatever you set in step 3)
 
 Other endpoints available after the stack is up:
 

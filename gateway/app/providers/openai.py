@@ -99,6 +99,7 @@ _LQ_AI_EXTENSION_KEYS = frozenset(
         "lq_ai_message_id",
         "lq_ai_user_id",
         "lq_ai_purpose",
+        "lq_ai_privileged",
     }
 )
 
@@ -146,6 +147,7 @@ class OpenAIAdapter(ProviderAdapter):
         self._client = client or httpx.AsyncClient(
             base_url=self._base_url,
             timeout=timeout_s,
+            headers={"User-Agent": "LQ-AI-Gateway/1.0"},
         )
 
     # --- Construction --------------------------------------------------------
