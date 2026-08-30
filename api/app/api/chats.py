@@ -63,6 +63,9 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
+
+# `trace` is for add_event() on the active span; spans use app.observability_helpers.
+from opentelemetry import trace
 from pydantic import BaseModel, ValidationError as PydanticValidationError
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,17 +76,20 @@ from app.audit import audit_action
 from app.citation import extract_citations, verify
 from app.citation.cost import estimate_judge_call_cost_usd
 from app.clients.gateway import EnsembleConfig, GatewayClient, get_gateway_client
+from app.config import get_settings
 from app.db.session import get_db
 from app.errors import LQAIError, NotFound, ValidationError
 from app.knowledge.embed import DEFAULT_EMBEDDING_MODEL, request_embedding_vector
 from app.knowledge.retrieval import HybridSearchResult, hybrid_search
 from app.models.chat import Chat, Message, MessageCitation
 from app.models.document import Document
+from app.models.file import File
 from app.models.inference import InferenceRoutingLog
 from app.models.knowledge import KnowledgeBase
 from app.models.project import Project
 from app.models.project_knowledge_base import ProjectKnowledgeBase
 from app.models.user import User
+from app.observability_helpers import get_tracer, record_attributes
 from app.schemas.chats import (
     LIST_LIMIT_DEFAULT,
     LIST_LIMIT_MAX,
@@ -110,6 +116,90 @@ from app.skills.registry import MutableSkillRegistry, SkillRegistry
 
 router = APIRouter(prefix="/chats", tags=["chats"])
 log = logging.getLogger(__name__)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token count for history budgeting — ~4 chars per token.
+
+    Deliberately dependency-free (no tiktoken / model tokenizer) per the
+    SBOM posture in CLAUDE.md. Slightly over-estimates for code/markup,
+    which is the safe direction for a budget cap. Never returns 0.
+    """
+    return max(1, (len(text) + 3) // 4)
+
+
+def _select_history_within_budget(
+    history: list[tuple[str, str]],
+    *,
+    token_budget: int,
+    max_messages: int,
+) -> list[tuple[str, str]]:
+    """Trim ``history`` to the most recent turns that fit the budget.
+
+    ``history`` is ``(role, content)`` in chronological order (oldest
+    first). Returns the most-recent turns that fit within BOTH
+    ``token_budget`` and ``max_messages``, back in chronological order.
+    Oldest turns drop first. The single most-recent turn is always kept
+    even if it alone exceeds the token budget — dropping it would discard
+    the context immediately preceding the live turn, which is the most
+    valuable. ``token_budget`` or ``max_messages`` of 0 disables history.
+    """
+    if token_budget <= 0 or max_messages <= 0:
+        return []
+    selected_rev: list[tuple[str, str]] = []
+    used = 0
+    for role, content in reversed(history):
+        if len(selected_rev) >= max_messages:
+            break
+        cost = _estimate_tokens(content)
+        if selected_rev and used + cost > token_budget:
+            break
+        used += cost
+        selected_rev.append((role, content))
+    selected_rev.reverse()
+    return selected_rev
+
+
+async def _load_history_messages(
+    db: AsyncSession,
+    *,
+    chat_id: uuid.UUID,
+    exclude_message_id: uuid.UUID,
+    token_budget: int,
+    max_messages: int,
+) -> list[ChatCompletionMessage]:
+    """Load prior conversation turns for ``chat_id`` as gateway messages.
+
+    Returns the most-recent ``user``/``assistant`` turns (chronological)
+    that fit the budget, EXCLUDING ``exclude_message_id`` — the just-
+    persisted current user turn, which the caller appends separately as
+    the live turn. Errored assistant rows (``error_code`` set) and rows
+    with empty content are skipped. History messages carry no
+    ``lq_ai_skip_anonymization`` flag, so the gateway pseudonymizes them
+    with the same per-request map as the current turn (consistent entity
+    mapping across the conversation).
+    """
+    if token_budget <= 0 or max_messages <= 0:
+        return []
+    stmt = (
+        select(Message.role, Message.content)
+        .where(
+            Message.chat_id == chat_id,
+            Message.id != exclude_message_id,
+            Message.role.in_(("user", "assistant")),
+            Message.error_code.is_(None),
+        )
+        .order_by(Message.created_at.asc(), Message.id.asc())
+    )
+    rows = (await db.execute(stmt)).all()
+    history: list[tuple[str, str]] = [(row[0], row[1]) for row in rows if row[1]]
+    selected = _select_history_within_budget(
+        history, token_budget=token_budget, max_messages=max_messages
+    )
+    return [
+        ChatCompletionMessage.model_validate({"role": role, "content": content})
+        for role, content in selected
+    ]
 
 
 # Wave D.2 Task 2.7 — send-time slash fallback. If the user's content
@@ -208,6 +298,129 @@ async def _load_visible_chat(
             details={"chat_id": str(chat_id)},
         )
     return row
+
+
+async def _validate_owned_file_ids(
+    db: AsyncSession,
+    file_ids: list[str],
+    owner_id: uuid.UUID,
+) -> list[str]:
+    """Validate caller-owned, non-deleted file ids for per-message attach.
+
+    Mirrors :func:`app.api.files._load_visible_file`'s ownership posture:
+    each id must parse as a UUID and resolve to a non-soft-deleted
+    ``files`` row owned by ``owner_id``. Any id that is malformed,
+    nonexistent, soft-deleted, or owned by another user raises
+    :class:`NotFound` (404) — **id-probing-safe**: a foreign file is
+    indistinguishable from a nonexistent one, so the caller can't probe
+    for the existence of files they don't own (per CLAUDE.md
+    information-leakage avoidance + the C4 file-ownership brief).
+
+    Returns the validated ids as strings (deduped, order-preserving) for
+    forwarding to the gateway as ``lq_ai_file_ids``. Empty input returns
+    an empty list without a DB round-trip — the back-compatible no-op
+    path.
+    """
+
+    if not file_ids:
+        return []
+
+    # Parse + dedupe while preserving first-seen order. A malformed id is
+    # a 404 (not a 422) so it's indistinguishable from "not yours" — the
+    # caller learns nothing about which ids exist.
+    parsed: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+    for raw in file_ids:
+        try:
+            fid = uuid.UUID(raw)
+        except (ValueError, AttributeError) as exc:
+            raise NotFound(
+                f"File {raw} not found.",
+                details={"file_id": str(raw)},
+            ) from exc
+        if fid not in seen:
+            seen.add(fid)
+            parsed.append(fid)
+
+    # Single SELECT for all ids, scoped to owner + not-deleted. Any id
+    # that doesn't come back is 404'd (the loop above already deduped).
+    stmt = select(File.id).where(
+        File.id.in_(parsed),
+        File.owner_id == owner_id,
+        File.deleted_at.is_(None),
+    )
+    found = set((await db.execute(stmt)).scalars().all())
+    for fid in parsed:
+        if fid not in found:
+            raise NotFound(
+                f"File {fid} not found.",
+                details={"file_id": str(fid)},
+            )
+
+    return [str(fid) for fid in parsed]
+
+
+async def _load_attached_file_contexts(
+    db: AsyncSession,
+    file_ids: list[str],
+    owner_id: uuid.UUID,
+) -> list[tuple[str, str]]:
+    """Load ``(filename, content)`` for per-message attached files, in caller order.
+
+    The text is :attr:`Document.normalized_content` (the canonical
+    PyMuPDF character stream) joined ``File → Document`` on
+    ``Document.file_id == File.id``. The query is **owner-scoped**
+    (``owner_id == ... AND deleted_at IS NULL``) as defense in depth —
+    even though :func:`_validate_owned_file_ids` has already validated
+    ownership upstream, this read re-asserts the boundary rather than
+    trusting the caller-supplied ids.
+
+    Files are returned in the order their ids appear in ``file_ids``
+    (deduped, first-seen). A file with **no Document row yet** (ingestion
+    pending or failed) or with empty ``normalized_content`` is OMITTED
+    from the result — it was validly attached, it just has no extractable
+    text to inject. This is graceful, not an error: the send still
+    proceeds, the file simply contributes no document-context block.
+
+    Empty input returns an empty list without a DB round-trip.
+    """
+
+    if not file_ids:
+        return []
+
+    parsed: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+    for raw in file_ids:
+        try:
+            fid = uuid.UUID(raw)
+        except (ValueError, AttributeError):
+            # Upstream validation already 404s malformed ids; if a bad id
+            # reaches here it simply contributes no context.
+            continue
+        if fid not in seen:
+            seen.add(fid)
+            parsed.append(fid)
+
+    stmt = (
+        select(File.id, File.filename, Document.normalized_content)
+        .join(Document, Document.file_id == File.id)
+        .where(
+            File.id.in_(parsed),
+            File.owner_id == owner_id,
+            File.deleted_at.is_(None),
+        )
+    )
+    rows = (await db.execute(stmt)).all()
+    by_id: dict[uuid.UUID, tuple[str, str]] = {}
+    for row in rows:
+        fid, filename, content = row[0], row[1], row[2]
+        # Omit files with no extractable text (empty / whitespace-only).
+        if content and content.strip():
+            by_id[fid] = (filename, content)
+
+    # Preserve caller-supplied order; files without a Document or with no
+    # text simply don't appear in ``by_id`` and are skipped.
+    return [by_id[fid] for fid in parsed if fid in by_id]
 
 
 async def _message_count(db: AsyncSession, chat_id: uuid.UUID) -> int:
@@ -855,6 +1068,37 @@ def _format_retrieval_context_block(
     return "\n".join(lines).rstrip()
 
 
+def _format_attached_files_block(files: list[tuple[str, str]]) -> str:
+    """Render per-message attached files as a Markdown system-message block.
+
+    Mirrors :func:`_format_retrieval_context_block`'s style: a header line
+    so the LLM recognizes the block as attached document context, then one
+    ``### {filename}`` section per file with the file's extracted text
+    verbatim. The block is injected as a ``system`` message marked
+    ``lq_ai_skip_anonymization=True`` so the content stays verbatim to the
+    provider (Decision M2-1 — attached files are document content, like
+    retrieved KB documents, and the model needs intact source text).
+
+    Callers must only pass files that actually produced text; this helper
+    does not filter (the empty-text omission happens in
+    :func:`_load_attached_file_contexts`).
+    """
+
+    lines: list[str] = [
+        "## Attached documents for this turn",
+        "",
+        "Documents the user attached to this message. Treat them as "
+        "primary source material for the user's question.",
+        "",
+    ]
+    for filename, content in files:
+        lines.append(f"### {filename}")
+        lines.append("")
+        lines.append(content)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 # ---------------------------------------------------------------------------
 # Messages: post (the keystone)
 # ---------------------------------------------------------------------------
@@ -920,6 +1164,15 @@ async def send_message(
     # archived). Posting to an archived chat returns 404 — clients
     # must explicitly unarchive (PATCH archived=false) before posting.
     chat = await _load_visible_chat(db, cid, user.id, include_archived=False)
+
+    # Donna — validate caller-owned ``file_ids`` before anything is
+    # persisted or dispatched. Ownership is enforced id-probing-safe
+    # (404 on foreign / nonexistent / soft-deleted, indistinguishable
+    # from one another) so the caller can't enumerate file ids they
+    # don't own. Validated ids forward to the gateway as
+    # ``lq_ai_file_ids`` and echo back as ``applied_file_ids``. Empty /
+    # omitted is a no-op (no DB round-trip) — back-compatible.
+    effective_file_ids = await _validate_owned_file_ids(db, payload.file_ids, user.id)
 
     # Wave D.2 Task 3.0 — merge legacy ``skills`` with new
     # ``attached_skills``. Each ``attached_skills`` entry is XOR'd at
@@ -1148,13 +1401,82 @@ async def send_message(
             },
         )
         await db.commit()
+
+    # Part B — inject per-message attached-file content as a verbatim
+    # document-context system message, mirroring the KB-retrieval block
+    # above. ``effective_file_ids`` are already ownership-validated;
+    # ``_load_attached_file_contexts`` re-asserts the owner scope (defense
+    # in depth) and returns ``(filename, content)`` per file that has
+    # extractable text. Files with no Document yet (ingestion pending /
+    # failed) or empty content are omitted gracefully — no block, no
+    # error. Decision M2-1: attached files are document content, so the
+    # injected message opts out of anonymization (verbatim to provider),
+    # exactly like the retrieval block. Injecting here — before the final
+    # ``user`` turn and at the single ``gw_messages`` build site — covers
+    # both the streaming and non-streaming dispatch paths.
+    attached_file_contexts = await _load_attached_file_contexts(
+        db, list(effective_file_ids), user.id
+    )
+    if attached_file_contexts:
+        attached_block = _format_attached_files_block(attached_file_contexts)
+        gw_messages.append(
+            ChatCompletionMessage(
+                role="system",
+                content=attached_block,
+                lq_ai_skip_anonymization=True,
+            )
+        )
+        # Audit row mirroring inference.kb_chunks_retrieved — committed on
+        # its own boundary so Receipts records that file content was
+        # attached regardless of the downstream gateway-call outcome.
+        await audit_action(
+            db,
+            user_id=user.id,
+            action="inference.message_files_attached",
+            resource_type="chat",
+            resource_id=str(cid),
+            project_id=chat.project_id,
+            request=request,
+            details={
+                # All validated file_ids forwarded this turn, vs. the count
+                # whose extracted text was actually injected as document
+                # context (a file with no parsed text yet is attached but
+                # contributes nothing) — kept as distinct fields so Receipts
+                # don't conflate "attached" with "reached the model".
+                "file_ids": list(effective_file_ids),
+                "attached_count": len(effective_file_ids),
+                "injected_count": len(attached_file_contexts),
+            },
+        )
+        await db.commit()
+
+    # Multi-turn memory — replay prior conversation turns so chat is
+    # genuinely conversational. Previously this path sent only the current
+    # turn (single-turn requests). History is trimmed most-recent-first to
+    # the configured token budget + message cap (oldest dropped); set
+    # ``LQ_AI_CHAT_HISTORY_TOKEN_BUDGET=0`` to revert to single-turn.
+    # Inserted AFTER the current-turn system context blocks (RAG / attached
+    # files) and BEFORE the live user turn, so the provider sees
+    # ``[system context] + [prior turns] + [current user turn]``. History
+    # turns carry no ``lq_ai_skip_anonymization`` flag, so the gateway
+    # pseudonymizes them with the same per-request map as the current turn
+    # (entities stay consistent across the conversation).
+    settings = get_settings()
+    history_messages = await _load_history_messages(
+        db,
+        chat_id=cid,
+        exclude_message_id=user_message.id,
+        token_budget=settings.lq_ai_chat_history_token_budget,
+        max_messages=settings.lq_ai_chat_history_max_messages,
+    )
+    gw_messages.extend(history_messages)
+
     gw_messages.append(ChatCompletionMessage(role="user", content=effective_content))
 
-    # Build the gateway request. C3 still sends a single-turn request
-    # (the user's content as one ``user`` message); a future task may
-    # widen this to include prior history. The gateway does the skill
-    # prompt assembly per ADR 0007. T7b prepends a system context
-    # block when KB retrieval returned chunks (see above).
+    # Build the gateway request. The gateway does the skill prompt
+    # assembly per ADR 0007. T7b prepends a system context block when KB
+    # retrieval returned chunks (see above); the replayed history sits
+    # between that context and the live user turn.
     #
     # Wave D.2 Task 3.0 — ``lq_ai_inline_skills`` carries inline-body
     # attachments. The gateway assembles them alongside ``lq_ai_skills``
@@ -1172,9 +1494,30 @@ async def send_message(
         lq_ai_skills=list(effective_skills),
         lq_ai_skill_inputs=dict(effective_skill_inputs),
         lq_ai_inline_skills=list(inline_skill_refs),
+        lq_ai_file_ids=list(effective_file_ids),
         lq_ai_project_minimum_inference_tier=project_floor,
         lq_ai_privileged=project_privileged,
     )
+
+    # M3-F2 / Task 6 — emit one ``skill.execute`` marker span per applied
+    # skill at the gateway-dispatch seam. The spans live under the same
+    # trace as the HTTP span auto-instrumented on the inbound request,
+    # giving operators a per-skill signal alongside the gateway's
+    # inference spans. Only slug-based skills are spanned here; inline-
+    # body skills (``__inline__<hex>``) are implementation artefacts, not
+    # catalogue entries, so they carry no registry metadata.
+    # Telemetry must never break a send: a failure emitting marker spans is
+    # logged and swallowed rather than propagated into the user's request.
+    try:
+        _emit_skill_spans(
+            list(effective_skills),
+            registry=_skill_registry_from_request(request),
+            project_id=chat.project_id,
+            project_privileged=project_privileged,
+            chat_id=cid,
+        )
+    except Exception:  # pragma: no cover - defensive telemetry guard
+        log.warning("skill_span_emit_failed", exc_info=True)
 
     log.info(
         "chat send_message",
@@ -1394,6 +1737,47 @@ def _skill_registry_from_request(http_request: Request | None) -> SkillRegistry 
     return holder.current()
 
 
+def _emit_skill_spans(
+    skill_slugs: list[str],
+    *,
+    registry: SkillRegistry | None,
+    project_id: uuid.UUID | None,
+    project_privileged: bool,
+    chat_id: uuid.UUID,
+) -> None:
+    """Emit one ``skill.execute`` span per applied skill (M3-F2 / Task 6).
+
+    Marker spans recording which skills were applied to a send; the
+    actual prompt assembly + inference run in the gateway under the same
+    trace. ``version`` comes from :attr:`Skill.version` when the
+    registry resolves the slug. ``author`` comes from
+    :attr:`Skill.author`, promoted to the wire shape from
+    :class:`LQAIFrontmatter` (DE-316); it is ``None`` only when the
+    skill's frontmatter omits ``author``. ``None`` attributes are
+    silently dropped by :func:`record_attributes` per the OTel
+    attribute-hygiene contract.
+
+    No-op when ``skill_slugs`` is empty. Safe to call before or after
+    ``gw_request`` construction — it does not mutate any shared state.
+    """
+
+    tracer = get_tracer()
+    for slug in skill_slugs:
+        skill = registry.get_skill(slug) if registry is not None else None
+        with tracer.start_as_current_span("skill.execute") as span:
+            record_attributes(
+                span,
+                **{
+                    "skill.slug": slug,
+                    "skill.version": getattr(skill, "version", None),
+                    "skill.author": getattr(skill, "author", None),
+                    "project.id": str(project_id) if project_id is not None else None,
+                    "project.privileged": project_privileged,
+                    "chat.id": str(chat_id),
+                },
+            )
+
+
 async def _resolve_ensemble_config(
     *,
     gateway: GatewayClient | None,
@@ -1483,6 +1867,13 @@ async def _resolve_ensemble_config(
                 "per_judge_usd": [float(c) for c in per_judge_costs],
             },
         )
+        trace.get_current_span().add_event(
+            "ensemble.budget_fallback",
+            attributes={
+                "estimated_usd": float(estimated_usd),
+                "budget_usd": float(config.max_cost_per_message_usd),
+            },
+        )
         return None
 
     return config
@@ -1535,16 +1926,23 @@ async def _persist_message_citations(
     if not retrieved_chunks:
         return
 
-    candidates = extract_citations(assistant_text, retrieved_chunks)
+    # Batch-load the documents the retrieved chunks point at so the
+    # verifier has ``document.normalized_content`` and the extractor
+    # has the same surface for the M3-0.2 / DE-277 chunk-boundary
+    # fallback. Loading by retrieved-chunk document_ids (rather than
+    # by candidate document_ids as M2 did) is a superset: every
+    # candidate's document is in this set by construction, and the
+    # extra documents the verifier never consults are negligible.
+    chunk_doc_ids = {chunk.document_id for chunk in retrieved_chunks}
+    doc_rows = (
+        (await db.execute(select(Document).where(Document.id.in_(chunk_doc_ids)))).scalars().all()
+    )
+    docs_by_id = {d.id: d for d in doc_rows}
+    doc_contents = {d.id: d.normalized_content for d in doc_rows}
+
+    candidates = extract_citations(assistant_text, retrieved_chunks, doc_contents)
     if not candidates:
         return
-
-    # Batch-load the documents the candidates point at so we don't
-    # round-trip the DB per citation. The verifier needs
-    # ``document.normalized_content`` to confirm the slice.
-    doc_ids = {c.source_document_id for c in candidates}
-    doc_rows = (await db.execute(select(Document).where(Document.id.in_(doc_ids)))).scalars().all()
-    docs_by_id = {d.id: d for d in doc_rows}
 
     # M2-C1: resolve the Stage 3 judge model once per persist call.
     # The lookup is process-cached on the GatewayClient, so the per-
@@ -1850,6 +2248,7 @@ async def _non_streaming_response(
         routed_provider=response.routed_provider,
         cost_estimate=response.cost_estimate,
         applied_skills=applied_skills,
+        applied_file_ids=list(request.lq_ai_file_ids),
         attached_skill_names=list(attached_skill_names or []),
         slash_unresolved=slash_unresolved,
     )
@@ -2067,6 +2466,10 @@ async def _stream_response(
                     "created_at": datetime.now(tz=UTC).isoformat(),
                 },
                 "applied_skills": last_applied_skills or [],
+                # Donna — echo the validated, caller-owned file ids that
+                # were forwarded to the gateway for this turn (mirrors
+                # ``applied_skills``; turn-scoped, not persisted).
+                "applied_file_ids": list(request.lq_ai_file_ids),
                 "citations": [],
                 "routed_inference_tier": last_tier,
                 "routed_provider": last_provider,

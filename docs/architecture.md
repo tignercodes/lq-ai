@@ -32,12 +32,13 @@ flowchart TB
             direction LR
             proj["<b>Project Service</b><br/>matter-scoped<br/>containers<br/>privilege flag<br/><i>M1</i>"]
             skill["<b>Skill Service</b><br/>incl. Org Profile<br/>singleton<br/><i>M1</i>"]
-            playbook["<b>Playbook Service</b><br/>LangGraph<br/>workflows<br/><i>M3</i>"]
-            doc["<b>Document Pipeline</b><br/>Docling + PyMuPDF +<br/>OCR + Citation Engine<br/><i>M2</i>"]
-            knowledge["<b>Knowledge Service</b><br/>pgvector + FTS;<br/>contract-relationship<br/>graph in M4<br/><i>M1/M4</i>"]
-            autonomous["<b>Autonomous Layer</b><br/>Pipelines · cron ·<br/>watches · per-user<br/>memory<br/><i>M4</i>"]
+            playbook["<b>Playbook + Tabular Service</b><br/>LangGraph workflows:<br/>playbook execute · Easy Playbook ·<br/>tabular multi-doc review<br/><i>M3</i>"]
+            doc["<b>Document Pipeline</b><br/>Docling + PyMuPDF +<br/>Citation Engine<br/>(OCR deferred — DE-320)<br/><i>M2</i>"]
+            knowledge["<b>Knowledge Service</b><br/>pgvector + FTS;<br/>contract-relationship<br/>graph slot (not built)<br/><i>M1</i>"]
+            autonomous["<b>Autonomous Layer</b><br/>five-phase executor · cron ·<br/>watches · schedules ·<br/>per-user memory · precedent board<br/><i>runs as arq job on arq-worker</i><br/><i>M4</i>"]
         end
 
+        worker["<b>Async Workers</b><br/>arq-worker — Easy Playbook · Tabular Review ·<br/>Autonomous sessions + cron (arq:m3a6 queue)<br/>ingest-worker — document pipeline (ingest queue)<br/><i>M1 ingest · M3 arq-worker · M4 autonomous</i>"]
         mcp["<b>MCP-Client Subsystem</b><br/>integration substrate;<br/>architectural slot opened in M2<br/>even though no connectors ship until M5+<br/><i>M2 slot</i>"]
         signal["<b>Signal Aggregation Service</b><br/>workspace events<br/>via MCP<br/><i>M5+ forward-looking</i>"]:::forwardLooking
     end
@@ -64,7 +65,7 @@ flowchart TB
     %% =========================================
     subgraph PROVIDERS["🌐 LLM Providers (operator's choice; configured per-deployment)"]
         direction LR
-        cloud["<b>Cloud Providers</b><br/>Anthropic · OpenAI · Vertex<br/>Cohere · Azure OpenAI · Bedrock<br/><i>Tier 2–4 depending on configuration</i>"]
+        cloud["<b>Cloud Providers</b><br/>Anthropic · OpenAI · Azure OpenAI<br/><i>Vertex · Bedrock deferred — DE-034/035</i><br/><i>Tier 2–4 depending on configuration</i>"]
         local["<b>Local Providers</b><br/>Ollama · vLLM · llama.cpp<br/>any OpenAI-compatible endpoint<br/><i>Tier 1 — air-gap-capable</i>"]
     end
 
@@ -106,6 +107,7 @@ flowchart TB
     api --> doc
     api --> knowledge
     api --> autonomous
+    autonomous -.->|"runs as<br/>arq job"| worker
 
     %% =========================================
     %%   EDGES — services to gateway
@@ -134,6 +136,14 @@ flowchart TB
     api --> redis
     doc --> minio
     api -->|audit log| postgres
+
+    %% =========================================
+    %%   EDGES — async workers (M1 ingest · M3 arq)
+    %% =========================================
+    redis -->|"dequeue jobs"| worker
+    worker -->|"inference"| gateway
+    worker -->|"results / chunks"| postgres
+    worker --> minio
 
     %% =========================================
     %%   EDGES — gateway to providers
@@ -248,18 +258,23 @@ M1 is the foundation release: a self-hostable deployment that delivers conversat
 
 ### M3 — Playbooks, Word Add-In, Tabular Review, Slack/Teams
 
-**Adds:**
-- Playbook Service with LangGraph executor and the Easy Playbook auto-generation wizard.
-- Word Add-In with Inference Tier badge in the task pane.
-- Tabular Review surface and `output_format: table` skill mode.
-- Slack/Teams Light Intake Bridge (optional, profile-gated; OAuth-installed bot for `/lq` slash commands).
+**Adds (all shipped in M3; fresh-install-verified at M3-E1):**
+- Playbook Service with LangGraph executor and the Easy Playbook auto-generation wizard. Per-position assessments carry verbatim `matched_text` + `cited_chunk_ids` (lexical-FTS anchoring), **not** the M2 Citation Engine verification cascade — Citation Engine integration for the playbook/tabular executors is deferred. See [docs/playbooks.md](playbooks.md).
+- Word Add-In **plumbing** — scaffold + OAuth (M3-B2) + self-served JS bundle + version handshake (M3-B8). The task pane is installable via the **unsigned-manifest** path (Microsoft 365 Admin Center) and authenticated against the operator's deployment. The in-Word feature surface inside each tab (chat against the open document, skills with tracked changes, playbook execution, Inference Tier badge) is deferred to M4 / community per [PRD §9 DE-287](PRD.md#9-deferred-enhancements-and-identified-future-work); the **signed manifest + enterprise distribution package (M3-B7)** is descoped to a community-led effort per [PRD §9 DE-295](PRD.md#9-deferred-enhancements-and-identified-future-work) — only the unsigned-manifest sideload path ships at v0.3.0. See [docs/word-addin.md](word-addin.md).
+- Tabular Review surface and `output_format: table` skill mode (M3-C1/C2) + XLSX/CSV export (M3-C4a). Per-cell citations are navigable: the read-side resolves each cell's grounding chunk to `source_file_id`/`source_page`/`source_text` (post-v0.4.0, #125), though the executor still does not mint real Citation-Engine rows ([DE-309](PRD.md#9-deferred-enhancements-and-identified-future-work)); per-column ensemble verification is now honored at execution (#127). See [docs/tabular-review.md](tabular-review.md).
+- Slack/Teams Light Intake Bridge **plumbing** — `slack-bridge` + `teams-bridge` services with OAuth install + admin UI shell. The `/lq` slash-command surface is deferred to M4 / community per [PRD §9 DE-288](PRD.md#9-deferred-enhancements-and-identified-future-work). The plumbing was verified **in isolation only** — a real OAuth round-trip against a public-URL tunnel has not been exercised ([DE-312](PRD.md#9-deferred-enhancements-and-identified-future-work), P1). See [docs/intake-bridges.md](intake-bridges.md).
+- Second `arq` worker process (`arq-worker`) for long-running Playbook + Tabular jobs (the `arq:m3a6` queue) — the Easy Playbook generation and tabular extraction pipelines run there to keep within the PRD §3.7 <10-minute NFR without competing with document ingest jobs on the existing `ingest-worker` queue.
 
-### M4 — Autonomous Layer and Contract Repository
+**Word add-in delivery flow.** The Word add-in's static bundle (`taskpane.html` + JS + CSS + manifest icons) lives at `word-addin/` and webpacks into `web/static/word-addin/`. The web container's SvelteKit build picks the directory up via the existing `COPY . .` step, so the bundle is served at `{deployment_origin}/word-addin/...` without any new routing logic. Operators generate per-deployment manifests via the admin UI (`/lq-ai/admin/word-addin` → `GET /api/v1/admin/word-addin/manifest`), which templates the operator's deployment URL into the XML, then sideload the **unsigned** manifest via Microsoft 365 Admin Center (which warns about the unsigned add-in — expected at v0.3.0). M3-B8 adds a version-handshake endpoint (`GET /api/v1/word-addin/version`) so the task pane surfaces a clear "update needed" overlay when the installed add-in version drifts from the deployment. The signed manifest + versioned distribution asset (M3-B7) is descoped to a community-led effort once code-signing-certificate procurement closes — see [PRD §9 DE-295](PRD.md#9-deferred-enhancements-and-identified-future-work).
 
-**Adds:**
-- Autonomous Layer (background pipelines, scheduled tasks, watches, per-user memory).
-- Contract Repository auto-relationship detection (amendments, restatements, references, master/sub edges over a Knowledge Base).
+### M4 — Autonomous Layer (SHIPPED)
+
+**Adds (shipped):**
+- **Autonomous Layer** — a background autonomous executor that runs **as an arq job (`autonomous_session_job`) on the existing `arq-worker`, not as a separate service**. It is a five-phase LangGraph state machine (intake → analysis → drafting → ethics_review → delivery); every external action routes through a single `guarded_tool_call` chokepoint that enforces three brakes — **R4** (per-session / per-trigger cost cap), **R5** (external halt + idle watchdog), **R6** (phase-gated tool grants). It ships the four primitives — watches, schedules, per-user memory, precedent board — plus honest per-session receipts, per-user opt-in, and a web dashboard. Two cron jobs also run on `arq-worker`: `autonomous_idle_watchdog` (reaps idle sessions) and `autonomous_schedule_dispatcher` (fires scheduled triggers). All of this shares Redis with the API on the `arq:m3a6` queue alongside the Easy Playbook + Tabular jobs. See [HONEST-STATE.md §5](HONEST-STATE.md#5-m4--autonomous-layer-shipped) for the per-capability catalog.
 - M4 design explicitly accommodates multi-step agents with human-in-the-loop guardrails — anticipating the M5+ Workflow Intelligence direction.
+
+**Not in M4 (tracked):**
+- **Contract Repository auto-relationship graph** (amendments, restatements, references, master/sub edges over a Knowledge Base) — a separate M4-roadmap capability that is **not built**; the Knowledge Service's contract-relationship graph slot remains unfilled.
 
 ### M5–M7 — Forward-Looking Workflow Intelligence (community-driven; not committed)
 
@@ -303,8 +318,8 @@ The gateway is shown as a single service in the main diagram; its internal reque
             └──────┬───────┘
                    ▼
             ┌──────────────┐
-            │ Provider     │  (HTTP/gRPC to Anthropic / OpenAI / Vertex /
-            │ Adapter      │   Cohere / Azure / Bedrock / Ollama / vLLM)
+            │ Provider     │  (HTTP/gRPC to Anthropic / OpenAI / Azure /
+            │ Adapter      │   Ollama / vLLM; Vertex + Bedrock deferred — DE-034/035)
             └──────┬───────┘
                    │
                  (response)
@@ -329,6 +344,8 @@ The gateway is shown as a single service in the main diagram; its internal reque
 The pipeline is what makes the Inference Tier model operationally real. **The Tier Derivation stage is the choke point**: every request gets classified, every classification is logged in the audit trail, and every UI surface reflects the actual routed tier in real time. The user does not have to take the application's word for it — they can verify the tier badge against the operator's gateway configuration and against the audit log entries.
 
 The Anonymization stages bracket the provider adapter; pseudonyms exist in the mapping table for the duration of the request (in process memory only — never persisted) and are rehydrated on the way back so the Citation Engine sees the original text for verification. Privilege-flagged Projects disable anonymization by default — for privileged content, the operator is better served by Tier 1 (local inference, no third-party touch) than by an anonymization layer that adds processing steps complicating a privilege analysis.
+
+The provider adapters resolve their keys from the gateway's secret store, and that store can be administered at runtime: an admin-only `/admin/v1/provider-keys` surface (proxied by the backend at `/api/v1/admin/provider-keys`) sets a key Fernet-encrypted into `gateway.yaml` and hot-applies it to the live adapter with no restart — keys can be added, rotated, and revoked without a redeploy (post-v0.4.0, #128; requires `LQ_AI_GATEWAY_MASTER_KEY`). Environment-supplied keys continue to work; the listing masks every key and reports its source (`env` vs `runtime`).
 
 For the full gateway specification including the configuration YAML and the OpenAPI surface, see [PRD §4](PRD.md#4-the-lq-ai-inference-gateway).
 
@@ -365,9 +382,9 @@ The application surfaces the routed tier in the chat UI in real time. Skills and
 A few elements are intentionally omitted from the main diagram for readability; they are present in the architecture and described in the PRD:
 
 - **Reverse proxy** (Caddy, Traefik, nginx) sits in front of the Web App and the API for production deployments. See [PRD §6.3 Production Deployment](PRD.md#63-production-deployment).
-- **Internal observability between components** — every service emits OpenTelemetry traces; the diagram shows the OTel sink rather than every individual instrumentation point.
+- **Internal observability between components** — every service emits OpenTelemetry traces; the diagram shows the OTel sink rather than every individual instrumentation point. W3C `traceparent` context propagates across the full `api → gateway → provider` chain (httpx auto-instrumentation injects on the way out, FastAPI auto-instrumentation extracts on the way in), so a single chat-send surfaces as **one end-to-end trace, not three** — verified by `test_trace_propagation.py` in both `api/` and `gateway/`. Beyond HTTP auto-instrumentation, the services emit **domain spans** for the high-value operations — `citation.verify` (with per-stage children + short-circuit/budget-fallback events), `anonymization.pre`/`anonymization.post`, `skill.execute` (one per applied skill), `inference.dispatch` (carrying `provider`/`model`/`tier`/`tokens`/`cost_usd`/`outcome`), and `playbook.execute`/`tabular.execute` with per-position/per-cell children. These are layered on top of the auto-instrumentation via a per-service `observability_helpers.py` (`@traced` + `record_attributes`) and are no-ops when OTel is disabled (the default). Span attributes carry **counts and types only, never raw entity values** — the anonymization promise is not allowed to regress through the telemetry side-channel (enforced by `gateway/tests/test_anonymization_observability.py`).
 - **Database migrations and schema management** — Alembic for the FastAPI backend, similar in the gateway. Operational detail, not architecture.
-- **Container orchestration** (Docker Compose for development, Helm for Kubernetes production) — deployment topology rather than runtime architecture.
+- **Container orchestration** (Docker Compose for development, Helm for Kubernetes production) — deployment topology rather than runtime architecture. The Mermaid diagram shows logical services (Document Pipeline, Playbook Service, etc.); at runtime, long-running work for several of these services is hosted in dedicated `arq` worker processes that share Redis with the API container but consume from disjoint queues. M2 shipped `ingest-worker` (Document Pipeline) consuming the ingest queue; M3-A6 adds `arq-worker` consuming `arq:m3a6`, which hosts the Easy Playbook generation and Tabular Review jobs; M4 adds the Autonomous Layer's `autonomous_session_job` plus two cron jobs (`autonomous_idle_watchdog`, `autonomous_schedule_dispatcher`) to that same `arq-worker` / `arq:m3a6` queue. Queue isolation prevents a long playbook generation, tabular run, or autonomous session from blocking document ingest and vice versa. The two worker processes run the same `api` image with different `WorkerSettings` (`app.workers.document_pipeline.WorkerSettings` for `ingest-worker`; `app.workers.arq_setup.WorkerSettings` for `arq-worker`). Because autonomous sessions execute skills, the `arq-worker` now mounts the skills corpus (`./skills:/skills:ro` + `LQ_AI_SKILLS_DIR`) and installs the skill registry at startup via the shared `app/skills/bootstrap.py::install_skill_registry` — the same bootstrap the api lifespan uses, with uniform fail-fast on a missing/unreadable skills dir (post-v0.4.0, #139). SIGHUP-driven skill reload stays **api-only**: a running worker keeps its boot-time registry snapshot until it is restarted.
 - **Citation Engine internals** — within the Document Pipeline service, the Citation Engine is a multi-stage process (structured generation → deterministic substring verification → tolerant-match verification → paraphrase-judge verification → side-panel rendering). The chat surface renders each emitted citation in one of five visual states (M2-C2): verified-exact and verified-tolerant (both green), verified-paraphrase (yellow), unverified (greyed text + `[unverified]` marker), and system-error (yellow warning; deferred to M2-D when the pipeline emits the signal). The visual contract is load-bearing for procurement review — a reviewer scanning the report should be able to identify unverified citations without reading the tooltips. [PRD §3.3](PRD.md#33-citation-engine-exact-quote) covers the engine internals in detail.
 
 ---

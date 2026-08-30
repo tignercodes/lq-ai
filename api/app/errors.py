@@ -66,6 +66,11 @@ CODE_PASSWORD_CHANGE_REQUIRED = "password_change_required"
 CODE_PAYLOAD_TOO_LARGE = "payload_too_large"
 CODE_CONFLICT = "conflict"
 CODE_MFA_ENROLLMENT_REQUIRED = "mfa_enrollment_required"
+CODE_RESEARCH_NOT_CONFIGURED = "research_not_configured"
+CODE_MCP_OAUTH_NOT_CONFIGURED = "mcp_oauth_not_configured"
+CODE_MCP_OAUTH_STATE_ERROR = "mcp_oauth_state_error"
+CODE_MCP_OAUTH_EXCHANGE_ERROR = "mcp_oauth_exchange_error"
+CODE_MCP_AUTHORIZATION_REQUIRED = "mcp_authorization_required"
 
 # Backend↔gateway crossing codes (also declared in gateway/app/errors.py).
 # These propagate from gateway responses into backend exceptions; the
@@ -84,6 +89,14 @@ CODE_INVALID_MODEL = "invalid_model"
 CODE_SKILL_NOT_FOUND = "skill_not_found"
 CODE_SKILL_FETCH_FAILED = "skill_fetch_failed"
 CODE_SKILL_INPUT_MISSING = "skill_input_missing"
+
+# M4 autonomous-layer control-flow codes. These are BACKEND-ONLY and do
+# NOT cross the gateway boundary. They are raised inside the autonomous
+# executor to halt the LangGraph run; the executor catches them so they
+# rarely surface on the HTTP wire.
+CODE_AUTONOMOUS_HALTED = "autonomous_halted"
+CODE_AUTONOMOUS_TOOL_NOT_GRANTED = "autonomous_tool_not_granted"
+CODE_AUTONOMOUS_COST_CAP_REACHED = "autonomous_cost_cap_reached"
 
 
 # --- Base class --------------------------------------------------------------
@@ -236,6 +249,15 @@ class MfaEnrollmentRequired(LQAIError):
     http_status = status.HTTP_403_FORBIDDEN
 
 
+class ResearchNotConfigured(LQAIError):
+    """No CourtListener tool-provider is configured in the gateway, so the
+    case-law research surface is unavailable. Distinct from a transient
+    gateway outage so the UI renders a calm 'not enabled' gate, not an error."""
+
+    code = CODE_RESEARCH_NOT_CONFIGURED
+    http_status = status.HTTP_503_SERVICE_UNAVAILABLE
+
+
 class PayloadTooLarge(LQAIError):
     """Request body exceeds the configured upload-size limit — 413.
 
@@ -261,6 +283,105 @@ class Conflict(LQAIError):
 
     code = CODE_CONFLICT
     http_status = status.HTTP_409_CONFLICT
+
+
+# --- M4 autonomous-layer brake exceptions ------------------------------------
+# Raised inside the autonomous executor to halt the LangGraph run.
+# The executor catches them; they do NOT normally surface on the HTTP wire.
+# They follow the LQAIError pattern so the canonical handler can serialise
+# them if they do reach the wire (e.g., during development or in tests).
+
+
+class AutonomousBrake(LQAIError):
+    """Base for all autonomous-executor halt exceptions.
+
+    Raised by the chokepoint (:func:`~app.autonomous.nodes.guarded_tool_call`,
+    M4-A3) to stop a LangGraph run. The executor catches subclasses of this
+    class and persists the appropriate halt state on the session row.
+
+    HTTP status defaults to 409 CONFLICT — a brake is a state conflict —
+    but these rarely reach the wire.
+    """
+
+    code: ClassVar[str] = CODE_AUTONOMOUS_HALTED
+    http_status: ClassVar[int] = status.HTTP_409_CONFLICT
+
+
+class SessionHalted(AutonomousBrake):
+    """The session was halted externally or by an idle-timeout (M4 R1/R2).
+
+    ``reason`` is a short slug (``"external_halt"``, ``"idle_timeout"``)
+    stored in ``details`` so the executor audit row and the wire envelope
+    carry it without parsing the message string.
+    """
+
+    code = CODE_AUTONOMOUS_HALTED
+    http_status = status.HTTP_409_CONFLICT
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "external_halt",
+        details: dict[str, Any] | None = None,
+        http_status: int | None = None,
+        code: str | None = None,
+    ) -> None:
+        merged: dict[str, Any] = dict(details) if details else {}
+        merged["reason"] = reason
+        super().__init__(message, details=merged, http_status=http_status, code=code)
+
+
+class ToolNotGranted(AutonomousBrake):
+    """The requested tool intent is not in the phase-grant set (M4 R3).
+
+    ``intent`` is the :class:`~app.autonomous.enums.ToolIntent` value
+    (as a string) and ``phase`` is the current
+    :class:`~app.schemas.autonomous.Phase` value (as a string). Both
+    land in ``details`` for the audit envelope.
+    """
+
+    code = CODE_AUTONOMOUS_TOOL_NOT_GRANTED
+    http_status = status.HTTP_409_CONFLICT
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        intent: str = "",
+        phase: str = "",
+        details: dict[str, Any] | None = None,
+        http_status: int | None = None,
+        code: str | None = None,
+    ) -> None:
+        merged: dict[str, Any] = dict(details) if details else {}
+        merged["intent"] = intent
+        merged["phase"] = phase
+        super().__init__(message, details=merged, http_status=http_status, code=code)
+
+
+class CostCapReached(AutonomousBrake):
+    """The projected cost of the next tool call would exceed the session cap (M4 R4).
+
+    ``projected_usd`` is a float carrying the pre-flight cost estimate
+    that tripped the cap, stored in ``details`` for the audit envelope.
+    """
+
+    code = CODE_AUTONOMOUS_COST_CAP_REACHED
+    http_status = status.HTTP_409_CONFLICT
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        projected_usd: float = 0.0,
+        details: dict[str, Any] | None = None,
+        http_status: int | None = None,
+        code: str | None = None,
+    ) -> None:
+        merged: dict[str, Any] = dict(details) if details else {}
+        merged["projected_usd"] = projected_usd
+        super().__init__(message, details=merged, http_status=http_status, code=code)
 
 
 # --- Gateway-crossing subclasses ---------------------------------------------
@@ -371,6 +492,53 @@ class SkillInputMissing(LQAIError):
     http_status = status.HTTP_400_BAD_REQUEST
 
 
+# --- PR4c MCP OAuth typed errors ---------------------------------------------
+
+
+class MCPOAuthNotConfigured(LQAIError):
+    """The requested MCP server is not a configured ``auth: oauth`` provider — 404."""
+
+    code = CODE_MCP_OAUTH_NOT_CONFIGURED
+    http_status = status.HTTP_404_NOT_FOUND
+
+
+class MCPOAuthStateError(LQAIError):
+    """Unknown / expired / replayed state, or an ``iss`` validation failure — 400.
+
+    The message is a fixed, non-secret reason slug; no state value, code, or
+    verifier is ever interpolated.
+    """
+
+    code = CODE_MCP_OAUTH_STATE_ERROR
+    http_status = status.HTTP_400_BAD_REQUEST
+
+
+class MCPOAuthExchangeError(LQAIError):
+    """The AS returned an OAuth error on code-exchange or refresh — 502.
+
+    Carries ONLY the AS ``error`` string code (RFC 6749 §5.2) — never the
+    token form, the code, the verifier, or any token value.
+    """
+
+    code = CODE_MCP_OAUTH_EXCHANGE_ERROR
+    http_status = status.HTTP_502_BAD_GATEWAY
+
+
+class MCPAuthorizationRequired(LQAIError):
+    """Admin refresh was called on a per-user OAuth server — 409.
+
+    Admin refresh covers ``none`` / ``bearer`` servers only. OAuth servers
+    require per-user authorization state that does not exist in the admin
+    context. Callers should direct the user to the user-scoped
+    ``/api/v1/mcp/oauth/{server}/authorize`` flow.
+
+    Carries only the server name — no token or secret material.
+    """
+
+    code = CODE_MCP_AUTHORIZATION_REQUIRED
+    http_status = status.HTTP_409_CONFLICT
+
+
 # --- Code → exception class registry -----------------------------------------
 # Used by the gateway-response translator (in app.clients.gateway) to map
 # a structured gateway error envelope into the right LQAIError subclass.
@@ -393,6 +561,13 @@ _GATEWAY_CODE_MAP: dict[str, type[LQAIError]] = {
     # through with the matching backend-side typed exception.
     "not_found": NotFound,
     "conflict": Conflict,
+    # Donna #7: runtime provider-key management. The gateway returns 400
+    # with this code when the master key (LQ_AI_GATEWAY_MASTER_KEY) is
+    # unset and a runtime key write is attempted. Map to ValidationError
+    # (400) so the operator sees a sensible 4xx — without this entry the
+    # code falls through to InternalError (500), which would mask an
+    # operator-actionable misconfiguration as a server fault.
+    "failed_precondition": ValidationError,
 }
 
 
@@ -410,6 +585,9 @@ def map_gateway_error_code(code: str) -> type[LQAIError]:
 # --- Public re-exports -------------------------------------------------------
 # Keep this list explicit so ``from app.errors import *`` is well-defined.
 __all__ = [
+    "CODE_AUTONOMOUS_COST_CAP_REACHED",
+    "CODE_AUTONOMOUS_HALTED",
+    "CODE_AUTONOMOUS_TOOL_NOT_GRANTED",
     "CODE_CONFLICT",
     "CODE_FORBIDDEN",
     "CODE_GATEWAY_INVALID_RESPONSE",
@@ -417,19 +595,26 @@ __all__ = [
     "CODE_GATEWAY_UNREACHABLE",
     "CODE_INTERNAL_ERROR",
     "CODE_INVALID_MODEL",
+    "CODE_MCP_AUTHORIZATION_REQUIRED",
+    "CODE_MCP_OAUTH_EXCHANGE_ERROR",
+    "CODE_MCP_OAUTH_NOT_CONFIGURED",
+    "CODE_MCP_OAUTH_STATE_ERROR",
     "CODE_MFA_ENROLLMENT_REQUIRED",
     "CODE_NOT_FOUND",
     "CODE_PASSWORD_CHANGE_REQUIRED",
     "CODE_PAYLOAD_TOO_LARGE",
     "CODE_PROVIDER_UNAVAILABLE",
     "CODE_RATE_LIMITED",
+    "CODE_RESEARCH_NOT_CONFIGURED",
     "CODE_SKILL_FETCH_FAILED",
     "CODE_SKILL_INPUT_MISSING",
     "CODE_SKILL_NOT_FOUND",
     "CODE_TIER_BELOW_MINIMUM",
     "CODE_UNAUTHORIZED",
     "CODE_VALIDATION_ERROR",
+    "AutonomousBrake",
     "Conflict",
+    "CostCapReached",
     "Forbidden",
     "GatewayInvalidResponse",
     "GatewayTimeout",
@@ -437,16 +622,23 @@ __all__ = [
     "InternalError",
     "InvalidModel",
     "LQAIError",
+    "MCPAuthorizationRequired",
+    "MCPOAuthExchangeError",
+    "MCPOAuthNotConfigured",
+    "MCPOAuthStateError",
     "MfaEnrollmentRequired",
     "NotFound",
     "PasswordChangeRequired",
     "PayloadTooLarge",
     "ProviderUnavailable",
     "RateLimited",
+    "ResearchNotConfigured",
+    "SessionHalted",
     "SkillFetchFailed",
     "SkillInputMissing",
     "SkillNotFound",
     "TierBelowMinimum",
+    "ToolNotGranted",
     "Unauthorized",
     "ValidationError",
     "map_gateway_error_code",

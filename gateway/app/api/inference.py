@@ -72,6 +72,7 @@ from app.clients.backend import BackendClient, Skill, get_backend_client
 from app.config import GatewayConfig
 from app.errors import LQAIError
 from app.model_discovery import ModelDiscoverer
+from app.observability_helpers import get_tracer, record_attributes
 from app.providers import (
     ChatCompletionChunk,
     ChatCompletionMessage,
@@ -96,6 +97,7 @@ from app.router import (
     RoutedProviderError,
     Router,
     estimate_cost,
+    outcome_label_from_error,
     resolve_alias_chain,
     synthesize_request_id,
 )
@@ -125,6 +127,19 @@ PROVIDER_HEADER: Final[str] = "X-LQ-AI-Routed-Provider"
 
 
 # --- Helpers ------------------------------------------------------------------
+
+
+def _cost_usd_float(cost_estimate: float | None) -> float | None:
+    """Return the cost estimate as a Python float suitable for an OTel attribute.
+
+    ``_annotate_response`` already converts the Decimal from ``estimate_cost``
+    to ``float`` via ``float(cost)`` before storing it on the response, so the
+    value arriving here is already ``float | None``.  The helper exists to make
+    the extraction intent explicit and to keep the span-instrumentation site
+    readable.
+    """
+
+    return cost_estimate
 
 
 def _not_implemented(
@@ -167,78 +182,97 @@ def _gateway_error(
     )
 
 
+def _classify_provider_error(exc: ProviderAdapterError) -> tuple[str, int]:
+    """Classify a provider adapter error into ``(gateway_code, http_status)``.
+
+    Single source of truth shared by the non-streaming response mapper
+    (:func:`_map_provider_error_to_response`), the streaming SSE error
+    frame, and the routing-log failure writers — so an upstream status is
+    classified identically on every path, not just the non-streaming one.
+
+    An upstream **4xx** (other than 429 and the invalid_model 404) is a
+    request-side, NON-retryable failure: the provider rejected the request
+    we assembled (bad param, oversized prompt, unsupported field, content
+    policy). It maps to ``invalid_request`` / 400 rather than the outage
+    code ``provider_unavailable`` / 502, so clients don't retry a request
+    that can never succeed and outage dashboards aren't polluted with
+    caller/config errors. Upstream 5xx and network failures stay
+    ``provider_unavailable``.
+    """
+
+    if isinstance(exc, ProviderUnsupportedError):
+        return exc.code, status.HTTP_501_NOT_IMPLEMENTED
+    if isinstance(exc, ProviderAuthError):
+        return exc.code, status.HTTP_502_BAD_GATEWAY
+    if isinstance(exc, ProviderHTTPError):
+        upstream = exc.upstream_status
+        if upstream == 429:
+            return "rate_limit_exceeded", status.HTTP_429_TOO_MANY_REQUESTS
+        if upstream == 404 and exc.code == "invalid_model":
+            # Adapter signaled "the request named a model the upstream
+            # can't serve" (e.g., Ollama's "model not found, pull first").
+            return "invalid_model", status.HTTP_400_BAD_REQUEST
+        if 400 <= upstream < 500:
+            return "invalid_request", status.HTTP_400_BAD_REQUEST
+        return exc.code, status.HTTP_502_BAD_GATEWAY
+    if isinstance(exc, ProviderNetworkError):
+        return exc.code, status.HTTP_503_SERVICE_UNAVAILABLE
+    return exc.code, status.HTTP_502_BAD_GATEWAY
+
+
 def _map_provider_error_to_response(exc: ProviderAdapterError) -> JSONResponse:
     """Map a :class:`ProviderAdapterError` to the right HTTP status + envelope.
 
-    Centralizes the mapping so the streaming and non-streaming paths use
-    the same rules. Per the gateway-openapi.yaml error enum:
+    Thin wrapper over :func:`_classify_provider_error` (the shared
+    classifier) plus operator-facing logging. Per the gateway-openapi.yaml
+    error enum:
 
     * Auth errors → ``unauthorized`` / 502 (the gateway is its own auth
       domain; an upstream credential failure is a misconfiguration, not
       the caller's fault).
     * Upstream 429 → ``rate_limit_exceeded`` / 429.
     * Upstream 404 with ``code = "invalid_model"`` (e.g., Ollama
-      "model not pulled") → ``invalid_model`` / 400. The caller named
-      a model the deployment can't serve — that's a request-side
-      mistake, not an upstream outage. Adapters set ``code`` on the
-      :class:`ProviderHTTPError` to opt into this mapping.
-    * Upstream other 4xx → ``provider_unavailable`` / 502.
+      "model not pulled") → ``invalid_model`` / 400.
+    * Upstream other 4xx → ``invalid_request`` / 400. The provider
+      rejected the request we assembled — request-side and non-retryable,
+      so it does NOT wear the outage code ``provider_unavailable``.
     * Upstream 5xx (after fallback exhausted) → ``provider_unavailable`` /
       502.
     * Network / DNS / TLS / timeout → ``provider_unavailable`` / 503.
     * ``ProviderUnsupportedError`` → ``not_implemented`` / 501.
     """
 
-    if isinstance(exc, ProviderUnsupportedError):
-        return _gateway_error(
-            code=exc.code,
-            message=exc.message,
-            http_status=status.HTTP_501_NOT_IMPLEMENTED,
-            details=exc.details,
-        )
+    code, http_status = _classify_provider_error(exc)
     if isinstance(exc, ProviderAuthError):
         logger.warning("provider auth rejected: %s", exc.message)
-        return _gateway_error(
-            code=exc.code,
-            message=exc.message,
-            http_status=status.HTTP_502_BAD_GATEWAY,
-            details=exc.details,
-        )
-    if isinstance(exc, ProviderHTTPError):
-        upstream = exc.upstream_status
-        if upstream == 429:
-            gw_status = status.HTTP_429_TOO_MANY_REQUESTS
-            gw_code = "rate_limit_exceeded"
-        elif upstream == 404 and exc.code == "invalid_model":
-            # Adapter signaled "the request named a model the upstream
-            # can't serve" (e.g., Ollama's "model not found, try
-            # pulling it first"). Surface as 400 invalid_model so
-            # callers see the request-side mistake clearly rather
-            # than a generic upstream-flake 502.
-            gw_status = status.HTTP_400_BAD_REQUEST
-            gw_code = "invalid_model"
-        else:
-            gw_status = status.HTTP_502_BAD_GATEWAY
-            gw_code = exc.code
-        return _gateway_error(
-            code=gw_code,
-            message=exc.message,
-            http_status=gw_status,
-            details=exc.details,
-        )
-    if isinstance(exc, ProviderNetworkError):
-        return _gateway_error(
-            code=exc.code,
-            message=exc.message,
-            http_status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            details=exc.details,
+    elif code == "invalid_request":
+        logger.warning(
+            "provider rejected request: upstream_status=%s provider=%s",
+            getattr(exc, "upstream_status", None),
+            exc.details.get("provider"),
         )
     return _gateway_error(
-        code=exc.code,
+        code=code,
         message=exc.message,
-        http_status=status.HTTP_502_BAD_GATEWAY,
+        http_status=http_status,
         details=exc.details,
     )
+
+
+def _failure_reason(error: ProviderAdapterError) -> str:
+    """Build the routing-log ``refusal_reason`` for an upstream failure.
+
+    Carries the *classified* gateway code (so a 4xx rejection reads
+    ``invalid_request``, not the class-default ``provider_unavailable``)
+    plus the upstream HTTP status when known — the distinguishing signal
+    an operator needs to tell a request rejection from a genuine outage
+    when reading inference_routing_log rows.
+    """
+
+    code, _ = _classify_provider_error(error)
+    if isinstance(error, ProviderHTTPError):
+        return f"upstream_error:{code}:status={error.upstream_status}"
+    return f"upstream_error:{code}"
 
 
 def _config(request: Request) -> GatewayConfig:
@@ -632,67 +666,107 @@ async def chat_completions(request: Request) -> JSONResponse | StreamingResponse
         )
 
     # --- Non-streaming path -------------------------------------------------
-    try:
-        result = await gw_router.chat_completion(chat_request)
-    except RoutedProviderError as wrapped:
-        # The router attributes the failure to the actual target that
-        # produced the error (rather than the last candidate). Unwrap
-        # here, write the routing-log row with that target, and map the
-        # underlying error to the right HTTP status.
-        await _write_failure(
+    # The span is created here (handler level) rather than inside the router
+    # so it can carry ``inference.cost_usd``, which is computed by
+    # ``_annotate_response`` on the success path — the router never sees cost.
+    # Streaming path is out of scope (deferred).
+    tracer = get_tracer()
+    with tracer.start_as_current_span("inference.dispatch") as dispatch_span:
+        try:
+            result = await gw_router.chat_completion(chat_request)
+        except RoutedProviderError as wrapped:
+            # The router attributes the failure to the actual target that
+            # produced the error (rather than the last candidate). Unwrap
+            # here, write the routing-log row with that target, and map the
+            # underlying error to the right HTTP status.
+            record_attributes(
+                dispatch_span,
+                **{
+                    "inference.provider": wrapped.target.provider.name,
+                    "inference.model": wrapped.target.native_model,
+                    "inference.tier": wrapped.target.routed_inference_tier,
+                    "inference.outcome": outcome_label_from_error(wrapped.error),
+                },
+            )
+            await _write_failure(
+                log_writer,
+                chat_request=chat_request,
+                target=wrapped.target,
+                request_id=request_id,
+                error=wrapped.error,
+                latency_ms=wrapped.latency_ms,
+                anonymization_applied=anon_mapper is not None,
+            )
+            return _map_provider_error_to_response(wrapped.error)
+        except NoAdapterAvailableError as exc:
+            # No model/tier here on purpose: when no adapter could be
+            # instantiated the resolved target carries no native model or
+            # tier, so only provider + outcome are meaningful.
+            record_attributes(
+                dispatch_span,
+                **{
+                    "inference.provider": candidates[0].provider.name,
+                    "inference.outcome": "unavailable",
+                },
+            )
+            await _write_unavailable(
+                log_writer,
+                chat_request=chat_request,
+                target=candidates[0],
+                request_id=request_id,
+                message=exc.message,
+                anonymization_applied=anon_mapper is not None,
+            )
+            return _gateway_error(
+                code="provider_unavailable",
+                message=exc.message,
+                http_status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                details={"provider": candidates[0].provider.name},
+            )
+
+        # --- Anonymization post-middleware (non-streaming) ----------------------
+        # When the pre-middleware fired (mapper is non-None), rehydrate the
+        # provider's response content back to the originals. The mapper is
+        # then dropped on function exit — never persisted, never logged.
+        if anon_mapper is not None:
+            post_anonymize_response(
+                response=result.response, mapper=anon_mapper, anonymizer=anonymizer
+            )
+
+        # --- Success: stamp tier on body, write log, return --------------------
+        annotated = _annotate_response(result.response, target=result.target, config=config)
+        if applied_skills:
+            annotated.lq_ai_applied_skills = list(applied_skills)
+        annotated.anonymization_applied = anon_mapper is not None
+        usage = result.response.usage
+        record_attributes(
+            dispatch_span,
+            **{
+                "inference.provider": result.target.provider.name,
+                "inference.model": result.target.native_model,
+                "inference.tier": result.target.routed_inference_tier,
+                "inference.outcome": "success",
+                "inference.tokens_in": usage.prompt_tokens if usage is not None else None,
+                "inference.tokens_out": usage.completion_tokens if usage is not None else None,
+                "inference.cost_usd": _cost_usd_float(annotated.cost_estimate),
+            },
+        )
+        await _write_success(
             log_writer,
             chat_request=chat_request,
-            target=wrapped.target,
+            result=result,
             request_id=request_id,
-            error=wrapped.error,
-            latency_ms=wrapped.latency_ms,
+            cost_estimate=annotated.cost_estimate,
             anonymization_applied=anon_mapper is not None,
         )
-        return _map_provider_error_to_response(wrapped.error)
-    except NoAdapterAvailableError as exc:
-        await _write_unavailable(
-            log_writer,
-            chat_request=chat_request,
-            target=candidates[0],
-            request_id=request_id,
-            message=exc.message,
-            anonymization_applied=anon_mapper is not None,
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=annotated.model_dump(mode="json", exclude_none=True),
+            headers={
+                TIER_HEADER: str(result.target.routed_inference_tier),
+                PROVIDER_HEADER: result.target.provider.name,
+            },
         )
-        return _gateway_error(
-            code="provider_unavailable",
-            message=exc.message,
-            http_status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            details={"provider": candidates[0].provider.name},
-        )
-
-    # --- Anonymization post-middleware (non-streaming) ----------------------
-    # When the pre-middleware fired (mapper is non-None), rehydrate the
-    # provider's response content back to the originals. The mapper is
-    # then dropped on function exit — never persisted, never logged.
-    if anon_mapper is not None:
-        post_anonymize_response(response=result.response, mapper=anon_mapper, anonymizer=anonymizer)
-
-    # --- Success: stamp tier on body, write log, return --------------------
-    annotated = _annotate_response(result.response, target=result.target, config=config)
-    if applied_skills:
-        annotated.lq_ai_applied_skills = list(applied_skills)
-    annotated.anonymization_applied = anon_mapper is not None
-    await _write_success(
-        log_writer,
-        chat_request=chat_request,
-        result=result,
-        request_id=request_id,
-        cost_estimate=annotated.cost_estimate,
-        anonymization_applied=anon_mapper is not None,
-    )
-    return JSONResponse(
-        status_code=status.HTTP_200_OK,
-        content=annotated.model_dump(mode="json", exclude_none=True),
-        headers={
-            TIER_HEADER: str(result.target.routed_inference_tier),
-            PROVIDER_HEADER: result.target.provider.name,
-        },
-    )
 
 
 @router.post("/embeddings", response_model=None)
@@ -1121,7 +1195,11 @@ async def _stream_openai_sse(
             payload = chunk.model_dump(mode="json", exclude_none=True)
             yield f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
     except ProviderAdapterError as exc:
-        envelope = {"error": {"code": exc.code, "message": exc.message, "details": exc.details}}
+        # Classify so a streaming upstream 4xx surfaces as invalid_request
+        # (not the raw class-default provider_unavailable) — same rule the
+        # non-streaming path applies via _map_provider_error_to_response.
+        code, _ = _classify_provider_error(exc)
+        envelope = {"error": {"code": code, "message": exc.message, "details": exc.details}}
         yield f"data: {json.dumps(envelope, separators=(',', ':'))}\n\n".encode()
         await _write_failure(
             log_writer,
@@ -1152,9 +1230,14 @@ async def _stream_openai_sse(
             payload = terminal.model_dump(mode="json", exclude_none=True)
             yield f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
 
-    yield b"data: [DONE]\n\n"
-
     # Persist the routing-log row using the final chunk's usage block.
+    # This MUST precede the `[DONE]` yield: the api-side consumer stops
+    # iterating on `[DONE]` and closes the stream context, which cancels
+    # this generator (throws GeneratorExit at the next suspended `yield`).
+    # Anything awaited after the `[DONE]` yield never runs — so every
+    # streamed success turn would persist zero routing-log rows. The
+    # failure path above writes before its `[DONE]` for the same reason;
+    # mirror that here.
     usage = (last_chunk.usage if last_chunk is not None else None) or None
     cost = (
         estimate_cost(
@@ -1184,6 +1267,8 @@ async def _stream_openai_sse(
             purpose=_purpose_from_request(chat_request),
         )
     )
+
+    yield b"data: [DONE]\n\n"
 
 
 async def _single_error_sse(*, code: str, message: str) -> AsyncIterator[bytes]:
@@ -1349,7 +1434,7 @@ async def _write_failure(
             latency_ms=latency_ms,
             anonymization_applied=anonymization_applied,
             refused=False,
-            refusal_reason=f"upstream_error:{error.code}",
+            refusal_reason=_failure_reason(error),
             request_id=request_id,
             chat_id=chat_id,
             message_id=message_id,
@@ -1575,7 +1660,7 @@ async def _write_embeddings_failure(
             routed_inference_tier=target.routed_inference_tier,
             latency_ms=latency_ms,
             refused=False,
-            refusal_reason=f"upstream_error:{error.code}",
+            refusal_reason=_failure_reason(error),
             request_id=request_id,
             purpose="embedding",
         )

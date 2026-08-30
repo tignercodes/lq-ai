@@ -41,6 +41,7 @@ The lifespan reads the path from ``GATEWAY_CONFIG_PATH``. Defaults:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -53,12 +54,14 @@ from fastapi.responses import JSONResponse
 from app import __version__
 from app.anonymization.engine import Anonymizer
 from app.api import admin_router, inference_router
+from app.api.oauth import router as oauth_router
+from app.api.tools import router as tools_router
 from app.clients.backend import (
     BackendClient,
     close_backend_client,
     configure_backend_client,
 )
-from app.config import GatewayConfig
+from app.config import GatewayConfig, ProviderConfig, ToolProviderConfig
 from app.config_holder import MutableConfigHolder, install_sighup_reload
 from app.config_loader import ConfigLoadError, load_config
 from app.db import engine_or_none
@@ -71,8 +74,12 @@ from app.providers import (
     OpenAIAdapter,
     ProviderAdapter,
 )
+from app.providers.tool.base import ToolProviderAdapter
+from app.providers.tool.courtlistener import CourtListenerToolAdapter
+from app.providers.tool.echo import EchoToolAdapter
 from app.router import Router
 from app.routing_log import NullRoutingLogWriter, RoutingLogWriter, SQLRoutingLogWriter
+from app.tool_egress_log import NullToolEgressLogWriter, SQLToolEgressLogWriter
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +88,10 @@ SERVICE_NAME = "lq-ai-gateway"
 DEFAULT_CONFIG_PATH = Path("gateway.yaml")
 """Default path the gateway looks for its config when ``GATEWAY_CONFIG_PATH``
 is unset. Resolved relative to the process cwd."""
+
+DEFAULT_MCP_CONFIG_NAME = "mcp.yaml"
+"""Default filename for the MCP server config, resolved as a sibling of the
+gateway config file. Overridden by ``MCP_CONFIG_PATH``."""
 
 
 def _resolve_config_path() -> Path:
@@ -92,6 +103,103 @@ def _resolve_config_path() -> Path:
     return DEFAULT_CONFIG_PATH
 
 
+def _resolve_mcp_config_path() -> Path | None:
+    """Return the effective MCP config path, or ``None`` if not found.
+
+    Checks ``MCP_CONFIG_PATH`` first; falls back to ``mcp.yaml`` as a sibling
+    of the resolved gateway config file. Returns the :class:`Path` only when
+    the file exists so callers don't need to guard themselves.
+    """
+
+    override = os.environ.get("MCP_CONFIG_PATH")
+    if override:
+        candidate = Path(override)
+        if not candidate.exists():
+            logger.warning(
+                "MCP_CONFIG_PATH is set to %r but the file does not exist; "
+                "MCP server config will not be loaded",
+                str(candidate),
+            )
+            return None
+        return candidate
+    else:
+        gateway_path = _resolve_config_path()
+        candidate = gateway_path.parent / DEFAULT_MCP_CONFIG_NAME
+    return candidate if candidate.exists() else None
+
+
+def build_adapter(provider: ProviderConfig) -> ProviderAdapter | None:
+    """Construct the adapter for one provider, or ``None`` if no live
+    adapter can be built.
+
+    ``None`` is returned for two distinct reasons:
+
+    (a) the provider is **disabled** (``enabled=False``); or
+    (b) the provider's ``type`` has **no adapter implementation** yet
+        (vertex/bedrock, or any unknown type).
+
+    Both mean "no live adapter was built" — they are not distinguished in
+    the return value. A caller that needs to tell "disabled" from
+    "unsupported type" apart (e.g. Task B's hot-apply) can re-check
+    ``provider.enabled`` / ``provider.type`` itself.
+
+    A supported, **enabled** provider whose key can't be resolved does
+    **not** return ``None`` — it raises :class:`ValueError`, the same
+    signal the ``from_config`` factories raise. Callers decide what to do
+    with that: startup (the lifespan loop) skips the provider with a
+    warning; runtime hot-apply (Task B) surfaces it.
+
+    This is the single source of truth for "which adapter does this
+    provider get"; it is reused by the lifespan at startup and by the
+    runtime BYOK hot-apply path (Donna #7, Task B). Behavior must match
+    the per-type dispatch the lifespan used previously, so the set of
+    adapters built for a given config is unchanged.
+    """
+
+    if not provider.enabled:
+        return None
+    if provider.type == "anthropic":
+        return AnthropicAdapter.from_config(provider)
+    if provider.type in ("openai", "openai_compatible"):
+        # C6 + B6: OpenAI adapter services both embeddings and chat
+        # completions and handles both ``openai`` and ``openai_compatible``.
+        return OpenAIAdapter.from_config(provider)
+    if provider.type == "azure_openai":
+        # M2-E1 (DE-267): Azure OpenAI mirrors the OpenAI wire shape with
+        # a deployment-scoped URL (+ api-version) and ``api-key`` auth.
+        return AzureOpenAIAdapter.from_config(provider)
+    if provider.type == "ollama":
+        # B6 partial: Ollama is the Mode-2 (air-gapped local inference)
+        # backbone per PRD §1.5.1 / §6.1.
+        return OllamaAdapter.from_config(provider)
+    # B6 lands the remaining adapters (Vertex, Bedrock); until then there
+    # is no adapter for those types (or any unknown type).
+    return None
+
+
+def build_tool_adapter(provider: ToolProviderConfig) -> ToolProviderAdapter | None:
+    """Construct the tool adapter for one provider, or ``None`` if disabled
+    or no adapter exists for the type. Validates the base_url against the
+    provider's egress policy at build time so a misconfig fails at startup."""
+    if not provider.enabled:
+        return None
+    if provider.type == "echo":
+        adapter = EchoToolAdapter.from_config(provider)
+        adapter.validate_base_url()
+        return adapter
+    if provider.type == "courtlistener":
+        cl_adapter = CourtListenerToolAdapter.from_config(provider)
+        cl_adapter.validate_base_url()
+        return cl_adapter
+    if provider.type == "mcp":
+        from app.providers.tool.mcp import MCPToolProviderAdapter
+
+        mcp_adapter = MCPToolProviderAdapter.from_config(provider)
+        mcp_adapter.validate_base_url()
+        return mcp_adapter
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Load and validate ``gateway.yaml`` on startup.
@@ -101,9 +209,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
 
     config_path = _resolve_config_path()
+    mcp_config_path = _resolve_mcp_config_path()
     logger.info("loading gateway config from %s", config_path)
+    if mcp_config_path is not None:
+        logger.info("loading mcp server config from %s", mcp_config_path)
     try:
-        config = load_config(config_path)
+        config = load_config(config_path, mcp_path=mcp_config_path)
     except ConfigLoadError:
         logger.exception("gateway config load failed; refusing to start")
         raise
@@ -133,97 +244,53 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # routes to a provider with no adapter.
     adapters: dict[str, ProviderAdapter] = {}
     for provider in config.providers:
-        if not provider.enabled:
+        try:
+            adapter = build_adapter(provider)
+        except ValueError as exc:
+            # Missing/unresolvable key for a supported provider — non-fatal
+            # at startup; the provider is skipped and chat requests routing
+            # to it get a clean 503 at request time.
+            logger.warning(
+                "skipping provider %r (type=%s): %s",
+                provider.name,
+                provider.type,
+                exc,
+            )
             continue
-        if provider.type == "anthropic":
-            try:
-                adapters[provider.name] = AnthropicAdapter.from_config(provider)
-                logger.info("instantiated Anthropic adapter for provider %r", provider.name)
-            except ValueError as exc:
-                logger.warning(
-                    "skipping Anthropic provider %r: %s",
-                    provider.name,
-                    exc,
-                )
-            continue
-        if provider.type in ("openai", "openai_compatible"):
-            # C6 + B6: OpenAI adapter services both embeddings and chat
-            # completions. The lifespan-time check matches the pattern
-            # for Anthropic: a missing key for cloud OpenAI is non-fatal
-            # at startup but produces a clean 503 at request time.
-            try:
-                adapters[provider.name] = OpenAIAdapter.from_config(provider)
-                logger.info(
-                    "instantiated OpenAI adapter for provider %r (type=%s)",
+        if adapter is None:
+            # Disabled, or a type with no adapter yet (vertex/bedrock).
+            if provider.enabled:
+                # B6 lands the remaining adapters (Vertex, Bedrock).
+                logger.debug(
+                    "no adapter for provider %r (type=%s); awaiting B6",
                     provider.name,
                     provider.type,
                 )
-            except ValueError as exc:
-                logger.warning(
-                    "skipping OpenAI provider %r: %s",
-                    provider.name,
-                    exc,
-                )
             continue
-        if provider.type == "azure_openai":
-            # M2-E1 (DE-267): Azure OpenAI mirrors the OpenAI wire shape
-            # with a different URL (deployment-scoped + api-version)
-            # and ``api-key`` auth. Missing key or missing api_version
-            # surfaces as a startup warning (skip provider) and a clean
-            # 503 at request time, matching OpenAI's lifespan posture.
-            try:
-                adapters[provider.name] = AzureOpenAIAdapter.from_config(provider)
-                logger.info(
-                    "instantiated Azure OpenAI adapter for provider %r",
-                    provider.name,
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "skipping Azure OpenAI provider %r: %s",
-                    provider.name,
-                    exc,
-                )
-            continue
-        if provider.type == "ollama":
-            # B6 partial: Ollama is the Mode-2 (air-gapped local
-            # inference) backbone per PRD §1.5.1 / §6.1. Chat
-            # completions are wired here; embeddings raise
-            # ProviderUnsupportedError (the embedding alias still routes
-            # through the OpenAI adapter per ADR 0008).
-            try:
-                adapters[provider.name] = OllamaAdapter.from_config(provider)
-                logger.info(
-                    "instantiated Ollama adapter for provider %r (base_url=%s)",
-                    provider.name,
-                    provider.base_url,
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "skipping Ollama provider %r: %s",
-                    provider.name,
-                    exc,
-                )
-            continue
-        # B6 lands the remaining adapters (Vertex, Bedrock).
-        logger.debug(
-            "no adapter for provider %r (type=%s); awaiting B6",
+        adapters[provider.name] = adapter
+        logger.info(
+            "instantiated %s adapter for provider %r (type=%s)",
+            type(adapter).__name__,
             provider.name,
             provider.type,
         )
     app.state.adapters = adapters
-
-    # B4: build the request router around the loaded config + adapter
-    # registry. Per-request handlers pull this off ``app.state.router``
-    # rather than reconstructing it on every call.
-    # D0.5: pass the holder's ``current`` so the router reads the live
-    # config snapshot on each call. After an admin alias edit lands,
-    # the very next request resolves against the new map without
-    # restart.
-    app.state.router = Router(
-        config=config,
-        adapters=adapters,
-        config_provider=config_holder.current,
-    )
+    # Donna #7: adapters displaced by a runtime BYOK hot-swap (Task B)
+    # are stashed here so they're closed at shutdown rather than
+    # mid-request. Empty at startup; Task B appends to it.
+    # Invariant the hot-swap MUST uphold: a displaced adapter is MOVED
+    # into this list — popped from the active ``adapters`` registry, not
+    # copied — so it lives in exactly one of the two collections.
+    # Otherwise shutdown's two close loops would double-close it.
+    retired_adapters: list[ProviderAdapter] = []
+    app.state.retired_adapters = retired_adapters
+    # Donna #7: serialize the runtime BYOK mutation (write → reload → swap)
+    # so two concurrent key mutations can't interleave their reload+swap and
+    # leave the live registry pointing at an adapter that doesn't match the
+    # on-disk config. The provider-key admin endpoints hold this lock across
+    # the whole mutation. Created here (inside the running event loop) so the
+    # lock binds to the right loop.
+    app.state.provider_key_lock = asyncio.Lock()
 
     # B4: wire the inference_routing_log writer. ``DATABASE_URL`` is
     # optional — without it the gateway falls back to a no-op writer
@@ -242,6 +309,59 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("inference_routing_log writer wired against DATABASE_URL")
     app.state.routing_log = routing_log
     app.state.db_engine = engine  # held so shutdown can dispose
+
+    # ADR 0014: build tool adapters for every configured tool provider.
+    # Disabled providers and unsupported types return None and are skipped.
+    # base_url is validated against the provider's egress allowlist at
+    # build time so a misconfig fails fast at startup rather than at
+    # request time.
+    tool_adapters: dict[str, ToolProviderAdapter] = {}
+    for tp in config.tool_providers:
+        try:
+            tool_adapter = build_tool_adapter(tp)
+        except Exception:
+            logger.exception(
+                "skipping tool provider %r (type=%s): egress validation failed",
+                tp.name,
+                tp.type,
+            )
+            continue
+        if tool_adapter is not None:
+            tool_adapters[tp.name] = tool_adapter
+            logger.info(
+                "instantiated %s adapter for tool provider %r (type=%s)",
+                type(tool_adapter).__name__,
+                tp.name,
+                tp.type,
+            )
+    app.state.tool_adapters = tool_adapters
+
+    tool_egress_writer = (
+        SQLToolEgressLogWriter(engine) if engine is not None else NullToolEgressLogWriter()
+    )
+    app.state.tool_egress_log = tool_egress_writer
+    if engine is not None:
+        logger.info("tool_egress_log writer wired against DATABASE_URL")
+    else:
+        logger.warning(
+            "DATABASE_URL is not set; tool_egress_log writes are disabled "
+            "(tool calls still work, but no audit rows are persisted)"
+        )
+
+    # B4: build the request router around the loaded config + adapter
+    # registry. Per-request handlers pull this off ``app.state.router``
+    # rather than reconstructing it on every call.
+    # D0.5: pass the holder's ``current`` so the router reads the live
+    # config snapshot on each call. After an admin alias edit lands,
+    # the very next request resolves against the new map without
+    # restart.
+    app.state.router = Router(
+        config=config,
+        adapters=adapters,
+        config_provider=config_holder.current,
+        tool_adapters=tool_adapters,
+        tool_egress_log=tool_egress_writer,
+    )
 
     # C2: backend HTTP client + skill cache. The client reads
     # LQ_AI_API_URL / LQ_AI_GATEWAY_KEY / LQ_AI_SKILL_CACHE_TTL_SECONDS
@@ -278,6 +398,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await adapter.aclose()
             except Exception:
                 logger.exception("error closing adapter %r", name)
+        # Donna #7: close any adapters retired by a runtime BYOK hot-swap.
+        # Defensive ``getattr`` — a test bypassing the lifespan may not
+        # have set the attribute.
+        retired = getattr(app.state, "retired_adapters", [])
+        if retired:
+            logger.info("closing %d retired adapters", len(retired))
+            for adapter in retired:
+                try:
+                    await adapter.aclose()
+                except Exception:
+                    logger.exception("error closing retired adapter")
+        # ADR 0014: close tool provider adapters.
+        if tool_adapters:
+            logger.info("closing %d tool adapters", len(tool_adapters))
+        for tool_name, tool_adapter in tool_adapters.items():
+            try:
+                await tool_adapter.aclose()
+            except Exception:
+                logger.exception("error closing tool adapter %r", tool_name)
         try:
             await close_backend_client()
         except Exception:
@@ -309,6 +448,8 @@ app = FastAPI(
 
 app.include_router(inference_router)
 app.include_router(admin_router)
+app.include_router(tools_router)
+app.include_router(oauth_router)
 
 # M-Obs.1 — Prometheus /metrics + OpenTelemetry (PRD §5.4). OTel is
 # off unless OTEL_EXPORTER_OTLP_ENDPOINT is set; that's the "no

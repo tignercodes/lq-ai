@@ -9,11 +9,11 @@
 The M3 milestone is the **feature-parity-and-surface-coverage** release. Four largely-independent tracks ship together:
 
 1. **Playbook engine + 4 built-in playbooks** ([PRD §3.7](PRD.md#37-playbooks)) — Playbook schema, LangGraph executor, Easy Playbook auto-generation wizard, execution UI in web app. 4 built-ins: NDA, Generic SaaS MSA, DPA (GDPR-aligned), Commercial MSA.
-2. **Word Add-In (Office.js)** ([PRD §3.9](PRD.md#39-word-add-in-m3)) — Chat against open document; apply skills to selection or whole doc; execute Playbooks against the doc; redlines as Word tracked changes; comments as Word comments; Inference Tier badge in the task pane; **signed manifest for enterprise sideload**.
+2. **Word Add-In (Office.js)** ([PRD §3.9](PRD.md#39-word-add-in-m3)) — **Plumbing only at v0.3.0**: scaffold + OAuth + version handshake + unsigned-manifest sideload via Microsoft 365 Admin Center. Feature surfaces (chat / skills / playbook execution / Inference Tier badge) descoped to M4 per [DE-287](PRD.md#de-287--word-add-in-feature-surface-chat-skills-playbooks-tier-badge--deferred-to-m4--community-contribution). Signed manifest + enterprise distribution package descoped to a community-led effort per [DE-295](PRD.md#de-295--word-add-in-code-signing-certificate--signed-manifest-ci-community-led).
 3. **Tabular / Multi-Document Review** ([PRD §3.14](PRD.md#314-tabular--multi-document-review-m3)) — `output_format: table` skill mode; tabular UI surface; bulk operations; XLSX/CSV export; cost preview before execution.
-4. **Slack / Teams Light Intake Bridge** ([PRD §3.15](PRD.md#315-slack--teams-light-intake-bridge-m3)) — OAuth install on Slack and Teams; `/lq` slash command (forward-as-chat) and `/lq ask` quick-skill flows; bot configuration in LQ.AI admin UI.
+4. **Slack / Teams Light Intake Bridge** ([PRD §3.15](PRD.md#315-slack--teams-light-intake-bridge-m3)) — **Plumbing only at v0.3.0**: OAuth install on Slack and Teams; bot configuration in LQ.AI admin UI. The `/lq` slash-command + `/lq ask` quick-skill surfaces are descoped to M4 per [DE-288](PRD.md#de-288--slackteams-lq-slash-command--quick-skill-flow--deferred-to-m4--community-contribution).
 
-M3 ships in **~8 weeks of focused work** per [PRD §8 M3](PRD.md#m3--playbooks-word-add-in-tabular-review-and-slackteams-8-weeks-after-m2). The phase breakdown is **sequential by complexity**: the Playbook engine is the substrate that Word Add-In and Tabular both build on, and Slack/Teams is the smallest independent surface. Within each phase, parallel-execution slots are marked **[parallel]**.
+M3 ships in **~5 weeks of focused work** after two rounds of scope-reduction (see effort table below). The phase breakdown is **sequential by complexity**: the Playbook engine is the substrate that Word Add-In and Tabular both build on, and Slack/Teams is the smallest independent surface. Within each phase, parallel-execution slots are marked **[parallel]**.
 
 This document supersedes any conflicting sequencing in earlier roadmap documents. The PRD §8 roadmap remains the canonical capability commitment; this document is the implementation contract.
 
@@ -72,15 +72,17 @@ The reasoning:
 
 Bot configuration lives in the LQ.AI admin UI (M3-D4), not in environment variables, so operators don't need to redeploy to change Slack/Teams config.
 
-### Decision M3-5: Signed Word manifest ships in v0.3, not a v0.3.1 follow-on
+### Decision M3-5: Signed Word manifest — revised to community-led at PR #59 (2026-05-21)
 
-The Office.js add-in's manifest XML ships **signed for enterprise sideload** in v0.3. Per Kevin's call at M3 kickoff. The reasoning:
+**Original decision (M3 kickoff):** The Office.js add-in's manifest XML ships signed for enterprise sideload in v0.3 as part of M3-B7. The signing work was sized for M3 (~12–16h); cert acquisition was expected to run as a procurement task starting at M3 kickoff in parallel with M3-A code work.
 
-- The Word Add-In's primary procurement story is "deploy through Microsoft 365 Admin Center." A signed manifest is the procurement-ready posture. An unsigned-or-dev-only-manifest first release loses the procurement story for v0.3.
-- Code-signing infrastructure (cert acquisition + CI signing job) is incremental engineering once; deferring it to v0.3.1 creates a release whose announcement is "the add-in you've been waiting for, but you can't deploy it yet."
-- The signing work is sized for M3 (~12-16h in M3-B7); it does not bend the M3 critical path materially.
+**Revised at PR #59 (2026-05-21):** M3-B7 is descoped to a community-led effort per [PRD §9 DE-295](PRD.md#de-295--word-add-in-code-signing-certificate--signed-manifest-ci-community-led). v0.3.0 ships the unsigned-manifest sideload path (manifest generated via the admin UI's "Generate manifest" download); the signed distribution package lands as a community PR (likely v0.3.1 or v0.3.2) when the cert procurement completes. The reasoning for the revision:
 
-Cert acquisition is a procurement task that should begin at M3 kickoff in parallel with M3-A code work; cert turnaround can be multiple weeks.
+- Code-signing certificate procurement is a real-world purchase + ongoing annual renewal. Coupling the v0.3.0 release to a procurement clock the maintainer team doesn't otherwise need to run trades release velocity for an enterprise-procurement-story gain that arrives ~2–4 weeks later regardless.
+- The signed-distribution story is still committed — it just moves to a community track. SignPath's open-source sponsorship path (free for qualifying open-source projects) is the recommended first attempt; community-funded DigiCert EV / Sectigo OV are alternatives. LegalQuants, Inc. holds the legal cert artifact; the community organizes procurement + funding.
+- The Microsoft 365 Admin Center sideload at v0.3.0 will show an "unsigned add-in" warning. This is acceptable for technical-savvy operators (the install path still works); enterprise procurement teams that reject unsigned add-ins wait for the v0.3.x community-led signed release.
+
+DE-295 captures the five concrete operator-UX implications gated until M3-B7 lands. The original procurement-track guidance ("start at M3 kickoff in parallel with M3-A code work") no longer applies — it now starts when a community member files the procurement tracking issue per DE-295's Phase A.
 
 ---
 
@@ -113,19 +115,23 @@ Three deferred enhancements surfaced during M2 land before the M3 tracks begin. 
 
 ### Task M3-0.2 — DE-277: Citation extractor chunk-boundary fallback
 
-**Scope:**
-- Implement document-scan fallback in `api/app/citation/verification.py` for the case where a citation's offsets fall on a chunk boundary and the cited span is split across two chunks.
-- On a Stage 1 or Stage 2 miss where the citation's `chunk_id` is adjacent to the next chunk in the same document, reconstruct the spanning region from `documents.normalized_content` (M2-A1 surface) and re-run Stage 1/2 against the spanning region.
-- Add a `verification_method = 'exact_match_spanning'` / `'tolerant_match_spanning'` variant to record that the verification used the cross-boundary path. UI renders this identically to the regular variants.
-- Unit tests in `api/tests/citation/test_chunk_boundary.py` covering: citation spanning two chunks; citation spanning three chunks (rare but possible for long quotes); citation entirely within one chunk (regression test — unaffected).
+**Scope** (corrected to track [DE-277 in PRD §9](PRD.md#de-277--citation-extractor-fallback-to-document-scan-on-chunk-boundary-miss) verbatim — the plan's original task description placed the fix in `verification.py`, but the actual gap is in `extraction.py`'s locator):
+
+- Extend `app/citation/extraction.py::extract_citations` with a full-document fallback. When the chunk-local locator (`_locate_in_chunk(quote, chunk.content)`) misses but the caller supplies the chunk's parent document's `normalized_content` (M2-A1 surface), retry the same exact-then-fuzzy locator against the full document.
+- Resolved offsets from the document-level scan are document-absolute already (no `chunk.char_offset_start` arithmetic); the downstream verifier reads against `documents.normalized_content` so the Stage 1 / Stage 2 logic verifies spanning candidates with no change. **No new `verification_method` values are required.**
+- Wire the chat-send pipeline (`app/api/chats.py::_persist_message_citations`) to pre-load documents for the retrieved-chunk doc_ids and pass the normalized-content map to `extract_citations`. The same loaded docs are reused by the verifier (no duplicate DB roundtrip).
+- Emit a structured `citation_chunk_mismatch` warning when the fallback fires (per [DE-277](PRD.md#de-277--citation-extractor-fallback-to-document-scan-on-chunk-boundary-miss) option b) — the citation still verifies, but the mismatch signal is worth surfacing for aggregate observability.
+- Unit tests in `api/tests/citation/test_chunk_boundary.py` covering: citation spanning two chunks; citation spanning three chunks (rare but possible for long quotes); citation entirely within one chunk (regression test — unaffected); chunk-mismatch warning emitted only on fallback path; backward compatibility when `document_contents` is not supplied.
+- Flip the existing `test_edge_cases.py::test_chunk_boundary_spanning_citation_does_not_extract_today` to assert the new behavior (`verification_method='exact_match'`, document-absolute offsets persisted).
 
 **Dependencies:** M2-A1 (normalized_content); M2-A2 (Stage 1); M2-B1 (Stage 2). All shipped at v0.2.0.
 
-**Output:** Citations split across chunk boundaries no longer fall to Stage 3 (LLM judge) when they could be verified verbatim.
+**Output:** Citations split across chunk boundaries no longer fall to Stage 3 (LLM judge) when they could be verified verbatim against the source document.
 
 **Verification:**
-- Test corpus includes citations deliberately authored across chunk boundaries; new spanning paths verify them.
+- Test corpus includes citations deliberately authored across chunk boundaries; the spanning fallback resolves them.
 - No regression in single-chunk verification (existing test suite passes unchanged).
+- The `citation_chunk_mismatch` warning surfaces in logs / Langfuse spans when the fallback fires.
 
 **Effort:** 4–6 hours.
 
@@ -254,7 +260,7 @@ The Playbook engine is the load-bearing substrate for two M3 tracks (Word Add-In
 
 ---
 
-### Task M3-A4 — Playbook execution UI in web app
+### Task M3-A4 — Playbook execution UI in web app — **SHIPPED at M3-A4**
 
 **Scope:**
 - New SvelteKit route in `web/src/routes/lq-ai/playbooks/` for:
@@ -277,6 +283,20 @@ The Playbook engine is the load-bearing substrate for two M3 tracks (Word Add-In
 
 **Effort:** 12–16 hours.
 
+**Implementation deviations from original scope (recorded for M3 milestone summary):**
+- §5.1 — `GET /api/v1/playbooks` + `GET /api/v1/playbooks/{id}` ship with M3-A4; `POST/PATCH/DELETE` defer to M3-A6 alongside the Easy Playbook wizard's create flow.
+- §5.2 — Cost preview is client-side against a static `PER_MODEL_RATES` table (`web/src/lib/lq-ai/playbookCost.ts`); a server-side cost-estimate endpoint was not added.
+- §5.3 — `PlaybookDisclaimerBanner.svelte` ships in M3-A4 (Decision F implication); CONTRIBUTING.md + PRD §1.3 attestation refresh still defer to the M3-close docs batch.
+- §5.4 — Result view uses dense rows + expand-to-reveal (table-style), not full-width vertical cards.
+- Apply-Playbook entry point is from `/lq-ai/playbooks` (playbook → pick doc), not from a document's context menu. Doc-context entry point deferred to M3-A6.
+- Citation Engine integration: per-position `cited_chunk_ids` render as chunk-id pills; full Stage 1–4 5-state UI integration deferred (the existing Citation Engine UI uses continuous relevance percentage, not 5 discrete states — gap surfaced during reconnaissance).
+- Backend follow-on: exposed `KBFileResponse.document_id` (the parsed-content row UUID, distinct from File id) so the modal's KB→file picker can resolve `target_document_id` client-side. 4-file change covering schema, query, TS type, OpenAPI.
+
+**Deferred items filed as M3-A4 follow-ons** (track in M3 milestone summary):
+- DE — Playbook position citations: open-in-document drilldown (Citation Engine 5-state coloring against `cited_chunk_ids`).
+- DE — Apply-Playbook from document context menu (M3-A6 candidate).
+- DE — Automated WCAG audit tooling (no a11y ESLint plugin in the codebase today; M3-A4 verified manually via browser devtools).
+
 ---
 
 ### Task M3-A5 — Remaining 3 built-in playbooks (MSA-SaaS, DPA, Commercial MSA)
@@ -285,20 +305,20 @@ The Playbook engine is the load-bearing substrate for two M3 tracks (Word Add-In
 - Author `skills/playbooks/msa-saas/playbook.yaml` — Generic SaaS MSA playbook; covers SLA, security commitments, data handling, IP, limitation of liability, indemnification, termination, audit rights, payment terms, governing law, change management.
 - Author `skills/playbooks/dpa-gdpr/playbook.yaml` — DPA (GDPR-aligned) playbook; covers Art. 28 (processor obligations), Art. 32 (security), Art. 33 (breach notification), international transfers (SCCs / TIA), sub-processor handling, audit rights, deletion / return of personal data, DSAR cooperation.
 - Author `skills/playbooks/msa-commercial-purchase/playbook.yaml` — Commercial MSA from purchase side; covers acceptance, warranties, indemnification, limitation of liability, IP, change orders, payment, termination for cause/convenience, governing law.
-- Each playbook gets practicing-attorney attestation in PR description.
-- Seed migration `0033_seed_builtin_playbooks_msa_dpa.py` inserts all three at version `1.0.0`.
-- Each gets one integration test against a representative sample contract in `api/tests/fixtures/`.
+- Each playbook carries the standard not-legal-advice disclaimer in its `description` field (Decision F locked at M3-A3 kickoff; the `test_description_includes_not_legal_advice_disclaimer` pattern from M3-A3 generalizes to each new playbook).
+- Seed migration `0033_seed_builtin_playbooks_msa_dpa.py` inserts all three at version `1.0.0`, following the M3-A3 pattern of reading the YAML files at upgrade time.
+- Each gets one integration test against a representative sample contract in `api/tests/fixtures/`. Sample contracts sourced from public-domain templates (Common Paper CC-BY-4.0, EU Commission SCCs, etc.) with attribution.
 
 **Dependencies:** M3-A4 (validates the end-to-end flow before scaling).
 
-**Output:** 4 built-in playbooks total are available out-of-the-box.
+**Output:** 4 built-in playbooks total are available out-of-the-box (NDA × 2 from M3-A3 + MSA-SaaS + DPA-GDPR + MSA-Commercial-Purchase).
 
 **Verification:**
 - Each playbook integration test passes.
-- Practicing-attorney attestation on PR.
-- Manual walk-through by reviewing attorney against ≥2 real-world contracts per playbook; outcomes are sensible.
+- Each playbook's description includes the not-legal-advice disclaimer (pinned by test).
+- Manual sanity check by Kevin against ≥1 representative sample contract per playbook; outcomes are plausible. Not a formal practicing-attorney attestation per Decision F — the disclaimer-in-description is the canonical posture and operators are expected to apply their own professional judgment.
 
-**Effort:** 12–16 hours.
+**Effort:** 12–16 hours (~80% legal-content drafting, ~20% engineering scaffold).
 
 ---
 
@@ -333,7 +353,12 @@ The Playbook engine is the load-bearing substrate for two M3 tracks (Word Add-In
 
 ## Phase B — Word Add-In (Weeks 4–5)
 
-The Word Add-In brings LQ.AI capabilities into Microsoft Word as an Office.js task pane. It surfaces chat, skills, and playbook execution against the open document, with redlines as tracked changes and assessments as Word comments. Phase B ends with a **signed manifest distribution package** suitable for enterprise sideload via Microsoft 365 Admin Center.
+The Word Add-In brings LQ.AI capabilities into Microsoft Word as an Office.js task pane. Phase B's **shipping plumbing in M3** (M3-B1 scaffold + M3-B2 OAuth + M3-B8 self-hosted JS bundle + version handshake) produces an installable, authenticated add-in distributable via Microsoft 365 Admin Center via the **unsigned-manifest** path. Two parallel scope-reductions land at v0.3.0:
+
+1. **The feature surface inside the task pane** (M3-B3 chat, M3-B4 skills with tracked-changes + comments rendering, M3-B5 playbook execution, M3-B6 Inference Tier badge) is descoped to M4 / community contribution per the 2026-05-21 close-out decision at the M3-A6 PR #57 close; see [PRD §9 DE-287](PRD.md#de-287--word-add-in-feature-surface-chat-skills-playbooks-tier-badge--deferred-to-m4--community-contribution).
+2. **M3-B7 (signed manifest + enterprise distribution package)** is descoped to a **community-led effort** per the 2026-05-21 PR #59 decision. Code-signing certificate procurement is real-world purchase + ongoing renewal work that couples the project's release cadence to a multi-week procurement clock; treating it as maintainer work overconstrains M3. The community organizes the procurement + funding (SignPath open-source sponsorship is the recommended first path; community-funded DigiCert EV or Sectigo OV are alternatives), LegalQuants holds the legal cert artifact, and the signing CI lands as a community PR once the cert is in hand. See [PRD §9 DE-295](PRD.md#de-295--word-add-in-code-signing-certificate--signed-manifest-ci-community-led) for the procurement plan + the v0.3.x → v0.3.y community-led signing rollout.
+
+Each descoped task below carries an inline status marker and retains its original scope text so a contributor picking up the work can claim it as a standalone PR against the plumbing.
 
 **Note for the contributor:** the `word-addin/` directory does not yet exist. M3-B1 is the first task to create it. Office.js development tooling (Node 18+, the `office-addin-debugging` toolchain, a Word client for testing) must be set up before this phase begins.
 
@@ -392,6 +417,8 @@ The Word Add-In brings LQ.AI capabilities into Microsoft Word as an Office.js ta
 
 ### Task M3-B3 — Chat against the open document
 
+**Status:** **Descoped to M4 / community contribution** per [PRD §9 DE-287](PRD.md#de-287--word-add-in-feature-surface-chat-skills-playbooks-tier-badge--deferred-to-m4--community-contribution). Scope retained below for a contributor claiming the task.
+
 **Scope:**
 - Task pane Chat tab: chat UI that mirrors the web app's chat UI, scaled for the narrower task pane.
 - "Open document context" toggle: when on, the contents of the open Word document are passed as initial context to the chat (the document is treated as an attached file).
@@ -413,6 +440,8 @@ The Word Add-In brings LQ.AI capabilities into Microsoft Word as an Office.js ta
 ---
 
 ### Task M3-B4 — Skills in Word (apply skill to selection or document)
+
+**Status:** **Descoped to M4 / community contribution** per [PRD §9 DE-287](PRD.md#de-287--word-add-in-feature-surface-chat-skills-playbooks-tier-badge--deferred-to-m4--community-contribution). Scope retained below for a contributor claiming the task.
 
 **Scope:**
 - Task pane Skills tab: list of available skills (from `GET /api/v1/skills`).
@@ -442,6 +471,8 @@ The Word Add-In brings LQ.AI capabilities into Microsoft Word as an Office.js ta
 
 ### Task M3-B5 — Playbook execution in Word
 
+**Status:** **Descoped to M4 / community contribution** per [PRD §9 DE-287](PRD.md#de-287--word-add-in-feature-surface-chat-skills-playbooks-tier-badge--deferred-to-m4--community-contribution). Scope retained below for a contributor claiming the task.
+
 **Scope:**
 - Task pane Playbooks tab: list of playbooks (built-in + user-created).
 - "Apply playbook" flow:
@@ -468,6 +499,8 @@ The Word Add-In brings LQ.AI capabilities into Microsoft Word as an Office.js ta
 
 ### Task M3-B6 — Inference Tier badge in task pane [parallel with M3-B5]
 
+**Status:** **Descoped to M4 / community contribution** per [PRD §9 DE-287](PRD.md#de-287--word-add-in-feature-surface-chat-skills-playbooks-tier-badge--deferred-to-m4--community-contribution). Scope retained below for a contributor claiming the task.
+
 **Scope:**
 - Add Inference Tier badge to the task pane header (matches the web app's badge per [PRD §3.13](PRD.md#313-inference-tier-awareness)).
 - Click-through opens the same tier-detail panel UI the web app uses (reuse the web app's component if practical; otherwise re-implement against the same `/api/v1/inference-tier-detail` endpoint).
@@ -488,27 +521,30 @@ The Word Add-In brings LQ.AI capabilities into Microsoft Word as an Office.js ta
 
 ### Task M3-B7 — Signed manifest + enterprise sideload distribution package
 
+**Status:** **Descoped to community-led effort** per [PRD §9 DE-295](PRD.md#de-295--word-add-in-code-signing-certificate--signed-manifest-ci-community-led). v0.3.0 ships the unsigned-manifest sideload path (manifest generated via the admin UI at `/lq-ai/admin/word-addin`); Microsoft 365 Admin Center will show an "unsigned add-in" warning during sideload until M3-B7 lands. The signing CI + signed distribution package land as a community PR when the code-signing cert procurement completes. Scope retained below for the community contributor claiming the task.
+
 **Scope:**
-- Acquire a code-signing certificate. Procurement task; **start at M3 kickoff** as cert turnaround can be multiple weeks. Track separately in PR template / project notes.
+- Acquire a code-signing certificate. **Community-led** per DE-295. Three credible paths: SignPath open-source sponsorship (free for qualifying open-source projects; recommended), community-funded DigiCert EV (~$500–700/yr; HSM/USB token; fastest SmartScreen warmup), or community-funded Sectigo OV (~$200–300/yr; longer SmartScreen warmup). The cert is issued to **LegalQuants, Inc.** (the legal entity that publishes the add-in); a community member walks the procurement + funding mechanism.
 - Wire signing into CI:
   - GitHub Actions workflow `.github/workflows/word-addin-release.yml` signs `manifest.xml` and the bundled JS on every release tag.
-  - Cert + private key stored as GitHub Actions secrets; manifest signing happens in a hardened workflow gated to the `release` environment.
+  - Cert + private key stored as GitHub Actions secrets (or accessed via the SignPath API if that path is chosen); manifest signing happens in a hardened workflow gated to the `release` environment.
 - Produce a distribution package:
-  - `word-addin-v0.3.zip` containing the signed manifest + a README with M365 Admin Center sideload instructions.
-  - Released as a GitHub Release asset on the v0.3 tag.
-- Update `docs/security/word-addin.md` (new doc) covering: signing chain of trust, what the operator should verify before deploying, threat model boundaries (the add-in runs in Office's web sandbox; it cannot access local files outside the document; it cannot call the LQ.AI backend without an OAuth token).
+  - `word-addin-v0.3.x.zip` containing the signed manifest + a README with M365 Admin Center sideload instructions.
+  - Released as a GitHub Release asset on the release tag.
+- Update M3-B8's version-handshake handler to populate the `taskpane_bundle_hash` field from the signing CI's build manifest (it ships nullable in v0.3.0; this completes the M3-B8 contract).
+- Create `docs/security/word-addin.md` covering: signing chain of trust, what the operator should verify before deploying (e.g., `signtool verify /pa manifest.xml`), threat model boundaries (the add-in runs in Office's web sandbox; it cannot access local files outside the document; it cannot call the LQ.AI backend without an OAuth token).
 - Security review per CODEOWNERS — touches signing infrastructure.
 
-**Dependencies:** M3-B6.
+**Dependencies:** v0.3.0 shipped with the unsigned-manifest path (this M3 PR). Cert procurement complete (community Phase A per DE-295).
 
-**Output:** Operators can download `word-addin-v0.3.zip`, verify the signature, and sideload via M365 Admin Center.
+**Output:** Operators can download `word-addin-v0.3.x.zip`, verify the signature, and sideload via M365 Admin Center without the "unsigned add-in" warning.
 
 **Verification:**
 - Manifest signature verifies against the issuing cert.
 - Sideloaded add-in works against a real LQ.AI deployment in Word desktop, Word Online, and Word for iPad.
 - Security reviewer signs off on the signing chain.
 
-**Effort:** 12–16 hours.
+**Effort:** 12–16 hours of community implementation work after the cert is in hand, plus the procurement timeline (typically 2–4 weeks for SignPath open-source approval; 1–3 weeks for a community-funded paid cert).
 
 ---
 
@@ -519,7 +555,7 @@ The Word Add-In brings LQ.AI capabilities into Microsoft Word as an Office.js ta
 - Add a version-handshake on add-in load: the add-in fetches `/api/v1/version` and compares its bundled version against the deployment's; if mismatched, surfaces a "Reload the add-in" prompt (avoids the v0.3 add-in talking to a v0.4 backend).
 - Update `docs/deploy/` operator guide for the Word Add-In: how to enable, how to generate the deployment-specific manifest, how to distribute via M365 Admin Center.
 
-**Dependencies:** M3-B7.
+**Dependencies:** M3-B2 (OAuth). The original plan listed M3-B7 as a dependency, but the M3 scope of B8 (self-served bundle + version handshake) doesn't require the signed-manifest CI to land first — the version handshake endpoint and the task-pane mount-time check operate the same way for both signed and unsigned manifests. M3-B7 (now community-led per [DE-295](PRD.md#de-295--word-add-in-code-signing-certificate--signed-manifest-ci-community-led)) will populate the `taskpane_bundle_hash` field that M3-B8 ships nullable.
 
 **Output:** A self-hosted LQ.AI deployment serves its own Word add-in bundle. No external CDN dependency.
 
@@ -542,7 +578,7 @@ Tabular Review is the second consumer of the LangGraph runtime landed in Phase A
 - For `output_format: table` skills, frontmatter adds:
   - `columns: [{name: str, query: str, ensemble_verification: bool}]` — each column is a per-row extraction query; ensemble is optionally on by default for high-stakes columns.
 - Update `docs/skill-authoring-guide.md` and [PRD §3.4](PRD.md#34-skill-service) to document the `table` mode.
-- Update the skill-schema validator in `api/app/skills/validators.py` to enforce the new fields.
+- Extend the skill-schema validator in `api/app/skills/schema.py` (existing module; no new `validators.py`) to enforce the new fields via a Pydantic `model_validator` on `LQAIFrontmatter`.
 - Authoring conventions: a `table`-mode skill cannot specify `output_format` and `report`-mode output in the same skill — they are mutually exclusive.
 
 **Dependencies:** Phase 0 + Phase A (LangGraph runtime).
@@ -613,33 +649,36 @@ Tabular Review is the second consumer of the LangGraph runtime landed in Phase A
 
 ---
 
-### Task M3-C4 — Bulk operations + XLSX/CSV export
+### Task M3-C4 — XLSX/CSV export (M3 scope) — **SHIPPED at M3-C4a**
 
-**Scope:**
-- Bulk operations from the tabular grid:
-  - "Redline column N in all rows" — runs an `output_format: report` skill that produces redlines per row.
-  - "Draft a memo summarizing column N" — runs a summary skill against the column's values.
-- Export:
-  - XLSX export — uses `openpyxl` (already in api deps? if not, pin a version). Each cell gets a comment with its citation source. Header row matches column names.
-  - CSV export — citations are flattened to a separate "citation_links" column.
-- Endpoint: `GET /api/v1/tabular/executions/{id}/export?format=xlsx|csv` — streams the file.
+**Status revision (2026-05-22, post-M3-C3 close):** the original spec bundled XLSX/CSV export with bulk operations ("Redline column N in all rows", "Draft memo summarizing column N"). Bulk operations is **descoped to post-M3** per [DE-304](PRD.md#de-304--tabular-review-bulk-operations-redline-per-row--summarize-column-deferred-from-m3-c4) — the architecture decisions on output pattern (new grid columns vs N new chats vs combined report view; new artifact type vs chat message vs markdown download) warrant a design conversation before code lands. M3-C4 ships export-only at v0.3.0.
+
+**Scope (M3-C4a — what shipped):**
+- Endpoint: `GET /api/v1/tabular/executions/{id}/export?format=xlsx|csv` — streams the file. 409 on non-completed executions. Audit row written on every export.
+- XLSX export — uses `openpyxl` (`>=3.1,<4`, added at this task). Each cell with at least one citation carries an openpyxl `Comment` listing citation IDs + confidences (cap of 5 per comment with `... and N more` overflow line; lead line preserves total). Header row matches column names.
+- CSV export — uses stdlib `csv` (no pandas dependency). Citations flattened to a trailing `citation_links` column with semicolon-separated `<column_name>:<citation_id>` pairs.
+- Failed cells render as `"(failed)"` in both formats so the gap is visible in the spreadsheet without consulting the source execution.
+
+**Scope (M3-C4b — descoped to DE-304):**
+- "Redline column N in all rows" — runs an `output_format: report` skill per row.
+- "Draft memo summarizing column N" — runs a summary skill against the column's values.
 
 **Dependencies:** M3-C3.
 
-**Output:** Operators can take the tabular result downstream in their existing Excel / spreadsheet workflows.
+**Output:** Operators can take the tabular result downstream in their existing Excel / spreadsheet workflows. Bulk operations land post-M3 once the output pattern is locked.
 
 **Verification:**
-- XLSX export opens cleanly in Excel desktop, Numbers (macOS), and Google Sheets.
-- CSV export round-trips through `pandas.read_csv()`.
-- Citation links in the XLSX comments resolve correctly when clicked (point at the deployment URL for the cited chunk).
+- XLSX export opens cleanly in Excel desktop, Numbers (macOS), and Google Sheets — verified by inspection on the synthetic NDA + MSA corpora during M3-C4a.
+- CSV export round-trips through stdlib `csv.reader` (the pandas roundtrip in the original spec was replaced by stdlib-only verification to avoid adding pandas to the api SBOM).
+- Citation links in the XLSX comments contain the citation IDs and confidence values; clickable deep-links from the comment to the deployment URL is a deferred enhancement (filed implicitly under DE-304's design conversation).
 
-**Effort:** 8–10 hours.
+**Effort:** 8–10 hours total estimate. M3-C4a's export-only landed in ~5 hr. M3-C4b is ~3–4 hr code + ~1–2 hr design conversation, deferred to v0.4 per DE-304.
 
 ---
 
 ## Phase D — Slack / Teams Light Intake Bridge (Weeks 7–8)
 
-The smallest and most independent track. Two bridges (Slack and Teams) ship as optional Docker Compose profiles. Two bot flows: `/lq` forwards a Slack/Teams message as the seed of a new LQ.AI chat; `/lq ask "..."` runs a short Org-Profile-configured skill and replies in-thread.
+The smallest and most independent track. Phase D's plumbing (M3-D1 slack-bridge + OAuth install, M3-D3 teams-bridge + OAuth install, M3-D4 admin UI bot configuration) ships in M3. The user-facing `/lq` slash command and its Teams parity (M3-D2 and the equivalent surface inside M3-D3) are **descoped to M4 / community contribution** per the 2026-05-21 scope-reduction decision at the M3-A6 PR #57 close; see [PRD §9 DE-288](PRD.md#de-288--slackteams-lq-slash-command--quick-skill-flow--deferred-to-m4--community-contribution). The bridges are installable and OAuth-bound at v0.3.0 but inert without the slash-command surface; a community contributor can claim the slash-command surface as a follow-up PR.
 
 ### Task M3-D1 — `slack-bridge` service + OAuth install flow
 
@@ -677,6 +716,8 @@ The smallest and most independent track. Two bridges (Slack and Teams) ship as o
 
 ### Task M3-D2 — `/lq` slash command + `/lq ask` quick-skill flow
 
+**Status:** **Descoped to M4 / community contribution** per [PRD §9 DE-288](PRD.md#de-288--slackteams-lq-slash-command--quick-skill-flow--deferred-to-m4--community-contribution). The plumbing tasks (M3-D1 Slack OAuth, M3-D3 Teams OAuth, M3-D4 admin UI) remain in M3 scope; this user-facing surface and its Teams mirror are deferred to M4 / community contribution. Scope retained below for a contributor claiming the task.
+
 **Scope:**
 - Implement two Slack slash command flows in the `slack-bridge` service:
   - `/lq` (no arg) on a thread or message: forwards the thread's content as the seed of a new LQ.AI chat. The bot replies in-thread with a link to the chat in the LQ.AI web app.
@@ -698,45 +739,50 @@ The smallest and most independent track. Two bridges (Slack and Teams) ship as o
 
 ### Task M3-D3 — `teams-bridge` service + Teams OAuth + `/lq` flows
 
+**Status:** Plumbing (Teams bridge service + OAuth install + identity mapping) **in M3 scope**. Slash-command surface (`/lq` and `/lq ask` flows) **descoped to M4 / community contribution** alongside the Slack-side M3-D2 per [PRD §9 DE-288](PRD.md#de-288--slackteams-lq-slash-command--quick-skill-flow--deferred-to-m4--community-contribution).
+
 **Scope:**
 - Mirror of M3-D1 + M3-D2 for Microsoft Teams:
-  - New `teams-bridge/` service (Python, FastAPI).
-  - Docker Compose `teams` profile.
-  - Teams bot manifest at `teams-bridge/manifest.json`.
-  - OAuth install flow using Microsoft Bot Framework auth.
-  - `/lq` and `/lq ask` flows identical in behavior to Slack.
-- Identity-mapping: Teams user's email (from M365) must match an LQ.AI user's email.
+  - New `teams-bridge/` service (Python, FastAPI). *(plumbing, M3 scope)*
+  - Docker Compose `teams` profile. *(plumbing, M3 scope)*
+  - Teams bot manifest at `teams-bridge/manifest.json`. *(plumbing, M3 scope)*
+  - OAuth install flow using Microsoft Bot Framework auth. *(plumbing, M3 scope)*
+  - `/lq` and `/lq ask` flows identical in behavior to Slack. *(descoped to M4 / community contribution per DE-288)*
+- Identity-mapping: Teams user's email (from M365) must match an LQ.AI user's email. *(plumbing, M3 scope)*
 - Security review per CODEOWNERS.
 
-**Dependencies:** M3-D2.
+**Dependencies:** M3-D1 (plumbing). The `/lq` flow parity depends on the Slack-side M3-D2 implementation that lands when DE-288 resolves.
 
-**Output:** Teams bridge parity with Slack bridge.
+**Output:** Teams bridge service is installable and OAuth-bound at v0.3.0 release; slash-command surface lands with DE-288.
 
 **Verification:**
-- Same as M3-D2 but in a Teams test tenant.
-- Confidentiality posture is symmetric with Slack: thread contents land in LQ.AI under the linked user's chat history.
+- Plumbing path: install the bot in a Teams test tenant; complete OAuth; confirm identity mapping surfaces in the LQ.AI admin UI (M3-D4).
+- Slash-command verification deferred to DE-288.
 
-**Effort:** 8–12 hours.
+**Effort:** ~4 hours for the plumbing-only path (down from the full 8–12-hour estimate that included the slash-command flow); the deferred slash-command surface is sized in DE-288.
 
 ---
 
 ### Task M3-D4 — Bot configuration in LQ.AI admin UI
 
+**Status:** Admin UI shell (install/uninstall, workspace/tenant name, linked-user count) **in M3 scope**. The "configure quick-ask skill" dropdown UI and the `/lq` invocation audit-log surface remain visible but inert until DE-288's slash-command surface lands — surfacing the dropdown alongside DE-288 keeps the admin UI from churning when the slash command arrives.
+
 **Scope:**
 - New SvelteKit admin route `web/src/routes/lq-ai/admin/intake-bridges/`:
-  - Slack section: install/uninstall, workspace name, linked-user count, "configure quick-ask skill" dropdown.
-  - Teams section: install/uninstall, tenant name, linked-user count, "configure quick-ask skill" dropdown.
-  - Audit log: recent `/lq` invocations with user / channel / matched-skill / cost.
+  - Slack section: install/uninstall, workspace name, linked-user count, "configure quick-ask skill" dropdown. *(install/uninstall + workspace name + linked-user count: M3 scope; quick-ask-skill dropdown UI visible but disabled with a "deferred to DE-288" tooltip until that DE resolves)*
+  - Teams section: install/uninstall, tenant name, linked-user count, "configure quick-ask skill" dropdown. *(same posture as Slack section)*
+  - Audit log: recent `/lq` invocations with user / channel / matched-skill / cost. *(UI shell ships empty in M3; populates when DE-288's slash-command flow lands)*
 - Backend: `/api/v1/admin/intake-bridges` endpoints for the above.
 
-**Dependencies:** M3-D3.
+**Dependencies:** M3-D3 (plumbing).
 
-**Output:** Admins configure Slack/Teams bridges entirely from the LQ.AI admin UI; no env-var edits, no redeploys for config changes.
+**Output:** Admins configure Slack/Teams bridge installation, OAuth status, and identity mapping entirely from the LQ.AI admin UI at v0.3.0 release; no env-var edits, no redeploys for plumbing-config changes. The quick-ask configuration surface arrives with DE-288.
 
 **Verification:**
-- Admin UI walks through install → configure quick-ask skill → test invocation → see invocation in audit log.
+- Plumbing path: admin UI walks through install → confirm OAuth status → confirm linked-user count.
+- Quick-ask configuration verification: deferred to DE-288.
 
-**Effort:** 6–8 hours.
+**Effort:** ~4–5 hours for the plumbing-only path (down from the full 6–8-hour estimate that assumed the slash-command surface was live).
 
 ---
 
@@ -746,22 +792,23 @@ The smallest and most independent track. Two bridges (Slack and Teams) ship as o
 
 **Scope:**
 - Destroy all volumes and images; fresh clone; full `docker compose up --build` with all M3-relevant profiles (`--profile slack --profile teams`).
-- Walk through each of the 4 M3 surfaces:
-  - Playbook engine: run NDA playbook against sample NDA in web app; verify result.
-  - Word Add-In: generate a manifest from admin UI; sideload in Word desktop; run a skill + a playbook; verify tracked changes + comments + citations.
+- Walk through the M3 surfaces that ship in v0.3.0:
+  - Playbook engine: run NDA playbook against sample NDA in web app; run the Easy Playbook wizard against 5 sample NDAs; verify both results.
+  - Word Add-In plumbing (M3-B1/B2/B8): generate a manifest from the admin UI; sideload in Word desktop via the unsigned-manifest path (Microsoft 365 Admin Center will warn about the unsigned add-in, which is expected at v0.3.0); confirm the task pane loads, OAuth completes, and the version handshake against the deployment succeeds. *(Feature surface inside the task pane is descoped to M4 per [DE-287](PRD.md#de-287--word-add-in-feature-surface-chat-skills-playbooks-tier-badge--deferred-to-m4--community-contribution); signed manifest + distribution package is descoped to community per [DE-295](PRD.md#de-295--word-add-in-code-signing-certificate--signed-manifest-ci-community-led); manifest-install + auth + version-check path is what verifies in M3.)*
   - Tabular Review: select 5 sample NDAs; run a 4-column tabular extraction; export XLSX; verify in Excel.
-  - Slack bridge: install in test workspace; run `/lq ask "what is an MSA?"`; verify in-thread reply + chat-link works.
+  - Slack bridge plumbing (M3-D1): install in a test workspace; complete OAuth; confirm identity binding surfaces in the LQ.AI admin UI (M3-D4). *(Slash-command surface descoped to M4 per [DE-288](PRD.md#de-288--slackteams-lq-slash-command--quick-skill-flow--deferred-to-m4--community-contribution); install + OAuth + identity binding is what verifies in M3.)*
+  - Teams bridge plumbing (M3-D3): same posture as Slack — install + OAuth + identity binding.
 - Document any blockers found as deferred enhancements **before** tagging.
-- Reviewing-attorney walk-through of the Playbook + Tabular surfaces against real-world contracts.
+- Reviewing-attorney walk-through of the Playbook (web) + Tabular surfaces against real-world contracts. *(Word add-in feature-surface review deferred to whichever milestone DE-287 lands in.)*
 
-**Dependencies:** All of Phases A–D.
+**Dependencies:** All of Phases A–D in their M3 scope.
 
-**Output:** Fresh-install validation passes; tagging-ready state confirmed.
+**Output:** Fresh-install validation passes for everything that ships in v0.3.0; tagging-ready state confirmed.
 
 **Verification:**
-- All 4 surfaces work end-to-end on a fresh install.
+- All M3-scope surfaces (Playbooks web + Easy Playbook, Word add-in plumbing, Tabular Review, Slack/Teams plumbing) work end-to-end on a fresh install.
 - Any blockers either fixed or explicitly accepted as DE-XXX entries with severity.
-- Reviewing-attorney signoff.
+- Reviewing-attorney signoff on the Playbook (web) + Tabular surfaces.
 
 **Effort:** 6–8 hours.
 
@@ -775,17 +822,22 @@ The smallest and most independent track. Two bridges (Slack and Teams) ship as o
   - `docs/word-addin.md` — Word Add-In documentation: architecture, installation (deployment-side + M365 Admin Center side), supported flows, manifest signing posture, threat model.
   - `docs/tabular-review.md` — Tabular Review documentation: skill `output_format: table` mode, LangGraph workflow, UI surface, export formats.
   - `docs/intake-bridges.md` — Slack and Teams bridge documentation: install flow, slash-command flows, configuration, security posture.
-- Two new Learn-tab playgrounds (per the M2 documentation convention):
-  - Playbook execution cascade — walks through how a playbook executes step-by-step against a sample contract.
-  - Tabular Review playground — interactive grid against a small sample document set.
+- Learn-tab playgrounds (per the M2 documentation convention — built with the `playground` skill, self-contained single-file explorers that render in `/lq-ai/learn`):
+  - **Playbook execution cascade** — walks an operator through how a playbook executes step-by-step against a sample contract: position-by-position extraction, classification, citation generation, and assembly into the final review. Uses one of the synthetic NDAs as the source document so the playground works offline.
+  - **Tabular Review interactive grid** — small N × M grid against a sample document set (e.g., 3 NDAs × 3 columns). Each cell click opens the citation modal so operators see the cell → citation flow. Pairs with the new `contract-snapshot` / `nda-snapshot` / `msa-snapshot` reference skills.
+  - **Word Add-In install + flow walkthrough** *(optional, "anything else from M3 worth visualizing")* — guided diagram of the unsigned-manifest sideload path, the OAuth flow between Word and the deployment, and the M3-B8 version-handshake interaction. Helpful because the Word add-in is the M3 surface most operators have not seen before (the chat surface, Knowledge, and Skills are M1 carryovers).
 - Updated documents:
-  - `docs/PRD.md` — changelog entry for M3 release; §3.7, §3.9, §3.14, §3.15 statuses flipped from "Deferred-M3" to "SHIPPED."
+  - `docs/PRD.md` — changelog entry for M3 release; §3.7 (Playbooks) and §3.14 (Tabular Review) statuses flipped from "Deferred-M3" to "SHIPPED"; §3.9 (Word Add-In) status flipped to "Plumbing shipped in M3 (unsigned-manifest path) — feature surface deferred to M4 (see DE-287); signed distribution community-led (see DE-295)"; §3.15 (Slack/Teams Bridge) status flipped to "Plumbing shipped in M3 — slash-command surface deferred to M4 (see DE-288)."
   - `docs/architecture.md` — Mermaid diagram updated with LangGraph runtime, Word add-in, tabular workflow, slack-bridge, teams-bridge components.
-  - `docs/quickstart.md` — new sections for Playbook execution, Word add-in install, Tabular review, Slack/Teams bridges.
-  - `README.md` — capability list updated to reflect M3 surfaces as shipped.
+  - `docs/quickstart.md` — new sections for Playbook execution, Word add-in install, Tabular review, Slack/Teams bridges. **Explicit developer onboarding pass:** the document must include a clean "I just cloned the repo — how do I pull dependencies, bring the stack up, log in, and verify the M3 surfaces are working?" path that a mid-level engineer can follow end-to-end without reading source. Includes the synthetic-corpus paths in `docs/quickstart/sample-ndas/` and `docs/quickstart/sample-msas/` as the worked examples for Playbook + Tabular Review.
+  - `README.md` — capability list updated to reflect M3 surfaces as shipped; "Getting started" section explicit about `git clone`, dependency install, `docker compose up`, first-login flow, and how to attach the synthetic corpus. The fresh-install verification path from M3-E1 doubles as the README's recommended walkthrough.
   - `docs/compliance/soc2-alignment.md` — controls updated for the new external trust boundaries (Word add-in OAuth, Slack/Teams bridges).
   - `docs/compliance/iso27001-alignment.md` — same.
   - `docs/procurement/sig-lite.md` — questions about Playbooks, Word add-in distribution, and Slack/Teams data-handling updated.
+- API documentation audit (covers OpenAPI sketches + db-schema + cross-references):
+  - `docs/api/backend-openapi.yaml` — every M3 endpoint (playbook CRUD + execute + executions; tabular preview-cost + execute + executions; word-addin OAuth + version + manifest-generate; slack-bridge + teams-bridge install + OAuth; any new admin-UI endpoints from M3-D4) reflects the shipped shape. Schema-conformance tests for each endpoint pass.
+  - `docs/db-schema.md` — every M3 migration's tables, columns, indexes, and constraints documented; foreign-key relationships diagrammed.
+  - PRD cross-references: every M3 task that landed should have a paragraph in the appropriate PRD §3 capability section linking back to the implementation; `grep -nE "M3-[A-Z][0-9]" docs/PRD.md` should return non-empty for every shipped M3 task.
 - New DE entries in `docs/PRD.md` §9:
   - DE-XXX (M3-1 alternative): separate `executor/` service for the LangGraph runtime.
   - DE-XXX: any other ideas surfaced during M3 build.
@@ -796,30 +848,97 @@ The smallest and most independent track. Two bridges (Slack and Teams) ship as o
 
 **Dependencies:** M3-E1.
 
-**Output:** Documentation matches implementation.
+**Output:** Documentation matches implementation; a fresh developer cloning the repo can stand up the stack and walk all M3 surfaces using only the README, quickstart, and the three Learn-tab playgrounds; the API surface is fully documented and conformance-tested.
 
 **Verification:**
 - Reviewing-attorney walk-through against the quickstart passes.
 - Cross-reference audit: `grep -rn` of internal links resolves cleanly.
 - PRD changelog entry committed.
+- **Developer onboarding check:** a non-maintainer engineer follows the README's Getting Started + the docs/quickstart.md walkthrough and can: (a) bring the stack up via `docker compose`, (b) log in as the bootstrap admin, (c) attach the synthetic NDA + MSA corpora, (d) run a Playbook against one NDA, (e) run a Tabular Review across 5 NDAs, (f) install the Word add-in via the unsigned-manifest path. No questions to the maintainer team during the walkthrough.
+- All three Learn-tab playgrounds render correctly on a fresh build (svelte-check passes; visual smoke against `/lq-ai/learn` confirms each is reachable from the index).
+- API doc audit grep: `grep -rn "M3-[A-Z][0-9]" docs/PRD.md` returns at least one match per shipped M3 task.
 
-**Effort:** 10–14 hours.
+**Effort:** 14–18 hours (raised from 10–14 to reflect the explicit playground + onboarding + API-audit scope).
+
+---
+
+## Phase F — Observability deepening (post-acceptance)
+
+Added 2026-05-22 per the OpenTelemetry Deepening mini-PRD at [`docs/proposals/opentelemetry-deepening.md`](proposals/opentelemetry-deepening.md). Phase F lands the operator-facing observability story that the M1 OTel SDK shipped but did not complete: end-to-end trace correlation across the api → gateway → provider chain, manual domain spans on the four high-value LQ.AI operations (Citation Engine cascade, Anonymization middleware, Skill runner, Playbook + Tabular workflows) with explicit anonymization-of-attributes guarantees, and deployment recipes plus a `docs/observability.md` operator guide.
+
+Phase F runs **after** M3-E1 + M3-E2 — fresh-install verification (E1) gets the observability stack as a test target, and the docs finalization (E2) absorbs the new `docs/observability.md` cross-references. The three F tasks correspond 1:1 to the three PRs in the mini-PRD.
+
+### Task M3-F1 — Trace context propagation audit + regression test
+
+**Scope:** Verify W3C `traceparent` / `tracestate` propagation across the api → gateway → provider chain, fix any gaps the audit surfaces, and pin the behavior with regression tests in both `api/tests/test_trace_propagation.py` and `gateway/tests/test_trace_propagation.py`. Update [`docs/architecture.md`](architecture.md) §OBS to confirm end-to-end correlation.
+
+**Dependencies:** None (the existing M1 OTel SDK + httpx-auto-instrumentation are the substrate).
+
+**Verification:** Per the [mini-PRD's PR 1 acceptance criteria](proposals/opentelemetry-deepening.md#pr-1-acceptance) — regression test exists in both services, asserts a chat-send produces a single trace ID across api + gateway, and would fail without any fix applied.
+
+**Effort:** ~6–8 hours.
+
+### Task M3-F2 — Domain spans + rich attributes on the four high-value operations
+
+**Scope:** Manual instrumentation of Citation Engine cascade (`api/app/citation/verification.py`), Anonymization middleware (`gateway/app/anonymization/middleware.py`), Skill runner, Inference dispatch (`gateway/app/router.py`), and Playbook + Tabular executors. Each gets a top-level span with documented attributes, child spans per sub-operation, and span events for notable transitions. Anonymization-of-attributes guarantee enforced via test: span attributes carry counts and types, never raw entity values.
+
+**Dependencies:** M3-F1 (so the spans land on already-correlated traces). M3-C2 + M3-C3 (so the tabular executor exists to instrument); both have shipped.
+
+**Verification:** Per the [mini-PRD's PR 2 acceptance criteria](proposals/opentelemetry-deepening.md#pr-2-acceptance) — each documented span + attribute is emitted under expected code paths (in-memory OTel exporter tests); `gateway/tests/test_anonymization_observability.py` asserts no raw entity values appear in span attributes; no measurable p99 chat-send regression.
+
+**Effort:** ~14–18 hours.
+
+### Task M3-F3 — Deployment recipes + `docs/observability.md` + OTel-evaluation Learn-tab playground
+
+**Scope:** New `deploy/observability/` subtree with two recipes (Grafana Tempo + Loki + Prometheus stack, and standalone Collector for operators with existing backends). New `docs/observability.md` operator guide covering the env-var matrix, per-signal inventory, anonymization-and-telemetry posture, the no-telemetry-by-default promise, and what's not yet shipped (links to DE-299 through DE-303). Starter Grafana dashboard with three panels (tier mix, p99 by route, error rate).
+
+**OTel-evaluation Learn-tab playground:** A new Learn-tab playground (built with the `playground` skill, sitting alongside the Playbook + Tabular Review playgrounds added in M3-E2) that explains how to *use* the OTel signals for operator evaluations. Walks through:
+- The trace tree for a representative chat-send (api request → gateway dispatch → provider call → citation cascade child spans → anonymization child spans), with annotations explaining what each span's attributes tell the operator.
+- The five operator questions the trace + metric inventory answers: (1) "why was this chat slow?" (2) "how much did this cost?" (3) "did anonymization run on this request?" (4) "which provider+model did each tier route to?" (5) "what is the citation-cascade outcome distribution across my traffic?"
+- Sample TraceQL / LogQL / Prometheus PromQL queries that pull each answer from the appropriate signal.
+- The anonymization-of-attributes guarantee: a side-by-side showing the attributes that DO appear in spans (entity counts, types, tiers) vs the attributes that do NOT (raw PERSON names, MATTER_NUMBERs).
+
+The playground is the bridge between the implementation work in M3-F1 + M3-F2 and the operator's day-2 reality: "I have OTel; how do I get value from it?" It pairs with `docs/observability.md` as the visual / interactive companion to the prose operator guide.
+
+**Dependencies:** M3-F2 (the recipe README walks operators through verifying domain spans land in Tempo, so the spans need to exist; the playground's annotated trace tree references the spans M3-F2 emits).
+
+**Verification:** Per the [mini-PRD's PR 3 acceptance criteria](proposals/opentelemetry-deepening.md#pr-3-acceptance) — `docker compose -f docker-compose.yml -f deploy/observability/grafana-tempo-loki/docker-compose.observability.yml config` produces a valid merged config; a non-maintainer following the recipe README sees a chat-send trace in Tempo within 15 minutes; `docs/observability.md` is linked from README.md Quickstart and HONEST-STATE.md §6+§7; "no telemetry by default" regression pinned by a test in `api/tests/test_observability.py`. **Playground verification:** the OTel-evaluation playground renders at `/lq-ai/learn`, walks through the five operator questions with sample queries, and the annotated trace tree references the actual span / attribute names emitted by M3-F2 (no drift between docs and code).
+
+**Effort:** ~16–22 hours (raised from 12–16 to reflect the OTel-evaluation playground scope).
+
+### Phase F deferred surfaces
+
+Seven OTel-adjacent surfaces are filed as DEs rather than absorbed into Phase F (per the mini-PRD's framing — any one can be claimed independently by a community contributor):
+
+- [DE-299](PRD.md#de-299--otel-instrumentation-for-sqlalchemy--arq-workers-otel-deepening-de-a) — SQLAlchemy + ARQ worker instrumentation
+- [DE-300](PRD.md#de-300--log-trace-correlation-via-structured-logger-trace_id--span_id-injection-otel-deepening-de-b) — Log-trace correlation
+- [DE-301](PRD.md#de-301--otel-meterprovider-for-metrics-export-otel-deepening-de-c) — OTel MeterProvider for metrics export
+- [DE-302](PRD.md#de-302--reconcile-otel-with-the-openwebui-fork-s-inherited-telemetry-otel-deepening-de-d) — Reconcile with the OpenWebUI fork's inherited OTel
+- [DE-303](PRD.md#de-303--browser-rum-via-opentelemetry-sdk-trace-web-otel-deepening-de-e) — Browser RUM (opt-in, CSP-reviewed)
+- PRD §9 — Published SLO catalog (already on the deferred list; builds on the M3-F2 span inventory)
+- PRD §9 — Performance regression tracking (already on the deferred list; builds on the M3-F2 span inventory)
 
 ---
 
 ## Total effort estimate
 
-| Phase | Tasks | Effort |
-|---|---|---|
-| **0 — Pre-M3 hardening** | 3 | ~13–18 hours |
-| **A — Playbook engine** | 6 | ~62–82 hours |
-| **B — Word Add-In** | 8 | ~70–90 hours |
-| **C — Tabular / Multi-Document Review** | 4 | ~36–48 hours |
-| **D — Slack / Teams Light Intake Bridge** | 4 | ~30–42 hours |
-| **E — Acceptance + docs** | 2 | ~16–22 hours |
-| **Total** | **27** | **~227–302 hours** |
+The original M3 estimate was ~227–302 hours across 27 tasks. Two rounds of scope-reduction land at v0.3.0:
 
-~265 hours fits in a focused **~8-week M3 build** by a single contributor working full-time (320 hours available), or ~12 weeks for someone working part-time. The estimate is *tight* — see Risks below. Parallel-execution opportunities (M3-B6 with M3-B5; M3-D track partially with C; cert acquisition for M3-B7 in parallel with all of Phase A) help.
+* **2026-05-21 (M3-A6 PR #57 close)** — descopes M3-B3/B4/B5/B6 (Word feature surface, ~34–44 hr; see [DE-287](PRD.md#de-287--word-add-in-feature-surface-chat-skills-playbooks-tier-badge--deferred-to-m4--community-contribution)) and M3-D2 + the slash-command facet of M3-D3 (Slack/Teams `/lq` surface, ~12–14 hr; see [DE-288](PRD.md#de-288--slackteams-lq-slash-command--quick-skill-flow--deferred-to-m4--community-contribution)); rescopes M3-D4 to plumbing-only (~4–5 hr instead of 6–8).
+* **2026-05-21 (M3 Phase B PR #59 open)** — descopes M3-B7 (signed manifest + enterprise distribution package, ~12–16 hr) to a community-led effort per [DE-295](PRD.md#de-295--word-add-in-code-signing-certificate--signed-manifest-ci-community-led). v0.3.0 ships the unsigned-manifest sideload path; the signing CI lands as a community PR when the cert procurement completes.
+
+| Phase | Tasks (M3 scope) | Effort |
+|---|---|---|
+| **0 — Pre-M3 hardening** | 3 (all shipped) | ~13–18 hours |
+| **A — Playbook engine** | 6 (all shipped through M3-A6) | ~62–82 hours |
+| **B — Word Add-In** | 3 plumbing in M3 (B1 + B2 + B8); 4 descoped to M4 (B3/B4/B5/B6 → DE-287); 1 descoped to community (B7 → DE-295) | ~22–28 hours |
+| **C — Tabular / Multi-Document Review** | 4 | ~36–48 hours |
+| **D — Slack / Teams Light Intake Bridge** | 3 plumbing (D1 + D3 plumbing-only + D4 plumbing-only); 1 descoped (D2 → DE-288); D3's slash-command facet also descoped | ~12–20 hours |
+| **E — Acceptance + docs (3 playgrounds + onboarding + API audit)** | 2 | ~20–26 hours |
+| **F — Observability deepening (incl. OTel-eval playground)** | 3 | ~36–48 hours |
+| **Total (M3 scope)** | **~19 active + 7 descoped** | **~201–276 hours** |
+
+The revised range fits comfortably in a **~6-week M3 build** by a single contributor working full-time, or ~10 weeks part-time. The largest remaining tracks are Phase C (Tabular Review) and Phase F (Observability deepening, added 2026-05-22). M3-E2 + M3-F3 together carry the three Learn-tab playgrounds (Playbook execution cascade; Tabular Review interactive grid; OTel-evaluation walkthrough), the developer onboarding pass on README + quickstart, and the API documentation audit. Phase B's M3 work is the smallest active track at ~22–28 hr; M3-B7 + its procurement timeline runs alongside on the community side.
 
 ---
 
@@ -843,7 +962,7 @@ The recommended workflow mirrors the M1 and M2 implementations:
 | Risk | Mitigation |
 |---|---|
 | M3 is genuinely 4 tracks in 8 weeks; scope creep would push v0.3 to v0.4 timing. | Decision B at M3-kickoff committed to "all four tracks must-ship." If mid-M3 a track is clearly slipping, surface as a scope-reframe decision to Kevin **before** tagging — not at release time. Build in a mid-M3 checkpoint (end of Phase B) for honest re-assessment. |
-| Code-signing certificate acquisition has multi-week lead time and could block M3-B7. | Procurement task **starts at M3 kickoff**, in parallel with all Phase A work. If cert is not in hand by end of Phase B, M3-B7 becomes a v0.3.1 follow-on and the v0.3 release notes are honest about the temporarily unsigned manifest path. |
+| Code-signing certificate acquisition has multi-week lead time. | **Revised at PR #59 (2026-05-21):** M3-B7 descoped to community-led effort per [DE-295](PRD.md#de-295--word-add-in-code-signing-certificate--signed-manifest-ci-community-led); the v0.3.0 release ships the unsigned-manifest sideload path with explicit "this signed at v0.3.x once the community procurement closes" framing in the release notes. SignPath open-source sponsorship is the recommended first path; community-funded DigiCert EV / Sectigo OV are alternatives. Maintainer release velocity is no longer coupled to the procurement clock. |
 | LangGraph version churn breaks the Playbook executor between releases. | Pin LangGraph version in `api/pyproject.toml`. Bug-fix LangGraph upgrades land as patch releases with regression tests. |
 | Word add-in development on a non-Windows primary dev machine (macOS-only contributor) limits coverage of Word desktop on Windows. | Office.js is cross-platform but Word Desktop on Windows is the dominant enterprise client. Test matrix in CI includes Word Desktop (macOS), Word Online, Word for iPad. Word Desktop (Windows) tested manually before tagging, with an explicit DE filed if a Windows-only issue is discovered. |
 | Easy Playbook wizard produces low-quality drafts on small / inconsistent corpora. | Reviewing-attorney quality review on a curated 5-corpus before M3-A6 closes. UI explicitly frames the output as "starting-point draft — review before use." Document expected corpus characteristics (≥5 documents, same contract type). |

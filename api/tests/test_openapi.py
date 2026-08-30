@@ -111,10 +111,30 @@ EXPECTED_PATHS: frozenset[str] = frozenset(
         # admin
         "/api/v1/admin/audit-log",
         "/api/v1/admin/tier-policy",
+        # M3-0.1 / DE-283 — unauthenticated fresh-install state probe
+        "/api/v1/admin/bootstrap-status",
+        # M3-0.3 / DE-276 — admin ingest-health aggregate
+        "/api/v1/admin/ingest-health",
+        # M3-B1 — Word add-in manifest generation (admin-only sideload helper)
+        "/api/v1/admin/word-addin/manifest",
+        # M3-B8 — Word add-in version handshake (unauthenticated)
+        "/api/v1/word-addin/version",
+        # M3-A2 — Playbook executor surface
+        "/api/v1/playbooks/{playbook_id}/execute",
+        "/api/v1/playbook-executions/{execution_id}",
+        # M3-A4 — Playbook list + detail
+        "/api/v1/playbooks",
+        "/api/v1/playbooks/{playbook_id}",
+        # M3-A6 — Easy Playbook wizard endpoints (Phase 5)
+        "/api/v1/playbooks/easy",
+        "/api/v1/playbooks/easy/{generation_id}",
         # D0.5 — model alias admin
         "/api/v1/admin/config",
         "/api/v1/admin/aliases",
         "/api/v1/admin/aliases/{name}",
+        # Donna #7 — runtime provider-key (BYOK) admin proxy
+        "/api/v1/admin/provider-keys",
+        "/api/v1/admin/provider-keys/{provider}",
         # D0 — model availability proxy
         "/api/v1/models",
         # Wave D.1 T4 — admin tier-floor override re-run
@@ -123,6 +143,69 @@ EXPECTED_PATHS: frozenset[str] = frozenset(
         "/api/v1/chats/{chat_id}/receipts",
         # Wave D.1 T6 — chat receipts JSONL export
         "/api/v1/chats/{chat_id}/receipts/export.jsonl",
+        # M3-C2 — Tabular / Multi-Document Review surface
+        "/api/v1/tabular/preview-cost",
+        "/api/v1/tabular/execute",
+        "/api/v1/tabular/executions",
+        "/api/v1/tabular/executions/{execution_id}",
+        "/api/v1/tabular/executions/{execution_id}/cancel",
+        # M3-C4a — XLSX/CSV export.
+        "/api/v1/tabular/executions/{execution_id}/export",
+        # M3-D1 — slack-bridge persistence surface (bearer-token, no user)
+        "/api/v1/integrations/slack/workspaces",
+        # M3-D3 — teams-bridge persistence surface (bearer-token, no user)
+        "/api/v1/integrations/teams/tenants",
+        # M3-D4 — admin intake-bridges surface (admin-only)
+        "/api/v1/admin/intake-bridges",
+        "/api/v1/admin/intake-bridges/slack/{workspace_id}",
+        "/api/v1/admin/intake-bridges/teams/{tenant_id}",
+        # M4-A4-i — Autonomous sessions read/halt API (per-user)
+        "/api/v1/autonomous/sessions",
+        "/api/v1/autonomous/sessions/{session_id}",
+        "/api/v1/autonomous/sessions/{session_id}/halt",
+        # Findings read-model — a run's persisted findings (work-product)
+        "/api/v1/autonomous/sessions/{session_id}/findings",
+        # Artifacts read-model — a run's document-grade artifact refs (Donna #8)
+        "/api/v1/autonomous/sessions/{session_id}/artifacts",
+        # M4-B1 — per-user memory curation API (list, keep, dismiss, delete)
+        "/api/v1/autonomous/memory",
+        "/api/v1/autonomous/memory/{memory_id}/keep",
+        "/api/v1/autonomous/memory/{memory_id}/dismiss",
+        "/api/v1/autonomous/memory/{memory_id}",
+        # M4-B2 — precedent board + promote-to-Project proposal lifecycle
+        "/api/v1/autonomous/precedents",
+        "/api/v1/autonomous/precedents/{precedent_id}/dismiss",
+        "/api/v1/autonomous/precedents/{precedent_id}/promote",
+        "/api/v1/autonomous/project-context-proposals",
+        "/api/v1/autonomous/project-context-proposals/{proposal_id}/accept",
+        "/api/v1/autonomous/project-context-proposals/{proposal_id}/reject",
+        # M4-B3 — scheduled autonomous tasks (create/list/patch/delete)
+        "/api/v1/autonomous/schedules",
+        "/api/v1/autonomous/schedules/{schedule_id}",
+        # M4-B4 — KB-arrival watches (create/list/patch/delete)
+        "/api/v1/autonomous/watches",
+        "/api/v1/autonomous/watches/{watch_id}",
+        # M4-C1 — notification read/dismiss API (list + mark-read)
+        "/api/v1/autonomous/notifications",
+        "/api/v1/autonomous/notifications/{notification_id}/read",
+        # Phase 1 §4.4 — one-off manual session spawn (run a skill/playbook now)
+        "/api/v1/autonomous/run-now",
+        # WS3b — case-law research surface
+        "/api/v1/research/capabilities",
+        "/api/v1/research/verify-citations",
+        "/api/v1/research/search",
+        "/api/v1/research/clusters/{cluster_id}",
+        "/api/v1/research/opinions/{opinion_id}",
+        "/api/v1/research/find-in-case",
+        # WS2/PR4b — MCP registry admin surface
+        "/api/v1/admin/mcp",
+        "/api/v1/admin/mcp/{server}/refresh",
+        "/api/v1/admin/mcp/{server}/tools/{tool}",
+        # PR4c — per-user MCP OAuth surface
+        "/api/v1/mcp/oauth/{server}/authorize",
+        "/api/v1/mcp/oauth/{server}/callback",
+        "/api/v1/mcp/oauth/{server}/status",
+        "/api/v1/mcp/oauth/{server}",
     }
 )
 
@@ -157,7 +240,81 @@ async def test_openapi_paths_match_sketch() -> None:
     # + Wave D.1 T4's /inference/override-tier-floor
     # + Wave D.2's three paths: /user-skills/{id}/versions,
     # /skills/autocomplete, /projects/sandbox/ensure.
-    assert len(actual) == 73
+    # + M3-0.1's /admin/bootstrap-status.
+    # + M3-0.3's /admin/ingest-health.
+    # + M3-A2's two playbook-executor endpoints.
+    # + M3-A4's two playbook list/detail endpoints.
+    # + M3-A6's Playbook CRUD adds POST/PATCH/DELETE methods on /playbooks +
+    #   /playbooks/{id} — paths already counted from M3-A4's GET endpoints, so
+    #   they contribute 0 new entries to this path-count assertion (the
+    #   method-tuple assertion in test_endpoints.py is the load-bearing check
+    #   for those).
+    # + M3-A6's two NEW paths for the Easy Playbook wizard
+    #   (POST /playbooks/easy + GET /playbooks/easy/{id}).
+    # + M3-B1's /admin/word-addin/manifest.
+    # + M3-B8's /word-addin/version.
+    # + M3-C2's five NEW paths for the Tabular surface
+    #   (/tabular/preview-cost, /tabular/execute, /tabular/executions,
+    #    /tabular/executions/{id}, /tabular/executions/{id}/cancel).
+    #   DELETE on /executions/{id} shares the GET path so it adds zero
+    #   new paths here; the method-tuple count is in test_endpoints.py.
+    # + M3-C4a's /tabular/executions/{id}/export.
+    # + M3-D1's one NEW path for the slack-bridge persistence surface
+    #   (POST /integrations/slack/workspaces). One method-tuple here;
+    #   the bridge is the sole caller so additional verbs aren't needed
+    #   in M3-D1 (uninstall comes in M3-D4 admin UI work).
+    # + M3-D3's one NEW path for the teams-bridge persistence surface
+    #   (POST /integrations/teams/tenants). Same posture as M3-D1's
+    #   slack equivalent.
+    # + M3-D4's three NEW paths for the admin intake-bridges surface
+    #   (GET /admin/intake-bridges, DELETE /admin/intake-bridges/slack/{id},
+    #   DELETE /admin/intake-bridges/teams/{id}). Admin-only.
+    # M4-A4-i adds three new paths:
+    # /api/v1/autonomous/sessions
+    # /api/v1/autonomous/sessions/{session_id}
+    # /api/v1/autonomous/sessions/{session_id}/halt
+    # M4-B1 adds four new paths:
+    # /api/v1/autonomous/memory
+    # /api/v1/autonomous/memory/{memory_id}/keep
+    # /api/v1/autonomous/memory/{memory_id}/dismiss
+    # /api/v1/autonomous/memory/{memory_id}
+    # M4-B2 adds six new paths:
+    # /api/v1/autonomous/precedents
+    # /api/v1/autonomous/precedents/{precedent_id}/dismiss
+    # /api/v1/autonomous/precedents/{precedent_id}/promote
+    # /api/v1/autonomous/project-context-proposals
+    # /api/v1/autonomous/project-context-proposals/{proposal_id}/accept
+    # /api/v1/autonomous/project-context-proposals/{proposal_id}/reject
+    # M4-B3 adds two new paths:
+    # /api/v1/autonomous/schedules
+    # /api/v1/autonomous/schedules/{schedule_id}
+    # M4-B4 adds two new paths:
+    # /api/v1/autonomous/watches
+    # /api/v1/autonomous/watches/{watch_id}
+    # M4-C1 adds two new paths:
+    # /api/v1/autonomous/notifications
+    # /api/v1/autonomous/notifications/{notification_id}/read
+    # Phase 1 §4.4 adds one new path:
+    # /api/v1/autonomous/run-now
+    # Donna #7 adds two new paths:
+    # /api/v1/admin/provider-keys
+    # /api/v1/admin/provider-keys/{provider}
+    # Findings read-model adds one new path:
+    # /api/v1/autonomous/sessions/{session_id}/findings
+    # Artifacts read-model (Donna #8) adds one new path:
+    # /api/v1/autonomous/sessions/{session_id}/artifacts
+    # WS3b-follow adds one new path (123 -> 124):
+    # /api/v1/research/capabilities
+    # WS2/PR4b adds three new paths (124 -> 127):
+    # /api/v1/admin/mcp
+    # /api/v1/admin/mcp/{server}/refresh
+    # /api/v1/admin/mcp/{server}/tools/{tool}
+    # PR4c adds four new paths (127 -> 131):
+    # /api/v1/mcp/oauth/{server}/authorize
+    # /api/v1/mcp/oauth/{server}/callback
+    # /api/v1/mcp/oauth/{server}/status
+    # /api/v1/mcp/oauth/{server}
+    assert len(actual) == 131
 
 
 @pytest.mark.unit

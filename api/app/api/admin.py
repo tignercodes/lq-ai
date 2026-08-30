@@ -7,6 +7,10 @@ Surface (current):
 * ``POST   /api/v1/admin/aliases``           — create alias (D0.5)
 * ``PATCH  /api/v1/admin/aliases/{name}``    — update alias (D0.5)
 * ``DELETE /api/v1/admin/aliases/{name}``    — remove alias (D0.5)
+* ``GET    /api/v1/admin/provider-keys``     — list provider-key status (Donna #7)
+* ``POST   /api/v1/admin/provider-keys``     — set/replace runtime key (Donna #7)
+* ``PATCH  /api/v1/admin/provider-keys/{p}`` — rotate runtime key (Donna #7)
+* ``DELETE /api/v1/admin/provider-keys/{p}`` — revoke runtime key (Donna #7)
 * ``GET    /api/v1/admin/config``            — sanitized gateway config (D0.5)
 * ``GET    /api/v1/admin/audit-log``         — 501 (D3 wires real impl)
 * ``GET    /api/v1/admin/tier-policy``       — 501 (D1)
@@ -32,7 +36,7 @@ import uuid as _uuid_mod
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, Select, Text, and_, func, select
@@ -42,6 +46,8 @@ from app.api.dependencies import AdminUser
 from app.clients.gateway import GatewayClient, get_gateway_client
 from app.db.session import get_db
 from app.models.audit import AuditLog
+from app.models.document import Document as DocumentORM
+from app.models.file import File as FileORM
 from app.models.user import User as UserORM
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -558,6 +564,91 @@ async def get_admin_config(
 
 
 # ---------------------------------------------------------------------------
+# Donna #7 — runtime provider-key (BYOK) proxy
+# ---------------------------------------------------------------------------
+# These endpoints proxy the gateway's ``/admin/v1/provider-keys`` surface,
+# mirroring the alias-CRUD proxy above. The backend is the only entity that
+# holds the gateway-key; the frontend never does. The gateway encrypts the
+# plaintext key, persists it to gateway.yaml, and hot-applies the rebuilt
+# adapter — the backend simply forwards the JSON. No secret is ever returned
+# (the gateway's status rows carry at most the last 4 characters of a key).
+#
+# Error propagation: the gateway returns 400 (``failed_precondition``) when
+# the master key is unset, 404 (``not_found``) for an unknown provider, and
+# 409 (``conflict``) when revoking a non-runtime (env-sourced) key. The
+# GatewayClient maps each via ``map_gateway_error_code`` to a backend typed
+# exception, so the same 4xx surfaces to the caller (the 400 master-key case
+# maps to ValidationError → 400, not a 500).
+
+
+class ProviderKeySetRequest(BaseModel):
+    """Request body for ``POST /api/v1/admin/provider-keys``."""
+
+    provider: str = Field(min_length=1)
+    api_key: str = Field(min_length=1)
+
+
+class ProviderKeyRotateRequest(BaseModel):
+    """Request body for ``PATCH /api/v1/admin/provider-keys/{provider}``."""
+
+    api_key: str = Field(min_length=1)
+
+
+@router.get("/provider-keys")
+async def list_provider_keys(
+    _admin: AdminUser,
+    gateway: Annotated[GatewayClient, Depends(get_gateway_client)],
+) -> dict[str, Any]:
+    """List provider-key status via the gateway. No secret is returned."""
+
+    return await gateway.list_provider_keys()
+
+
+@router.post("/provider-keys")
+async def set_provider_key(
+    body: ProviderKeySetRequest,
+    _admin: AdminUser,
+    gateway: Annotated[GatewayClient, Depends(get_gateway_client)],
+) -> dict[str, Any]:
+    """Set/replace a provider's runtime key. 400 / 404 propagate from the gateway."""
+
+    return await gateway.set_provider_key(body.model_dump(mode="json"))
+
+
+@router.patch("/provider-keys/{provider}")
+async def rotate_provider_key(
+    provider: str,
+    body: ProviderKeyRotateRequest,
+    _admin: AdminUser,
+    gateway: Annotated[GatewayClient, Depends(get_gateway_client)],
+) -> dict[str, Any]:
+    """Rotate a provider's runtime key. 400 / 404 propagate from the gateway."""
+
+    return await gateway.rotate_provider_key(provider, body.model_dump(mode="json"))
+
+
+@router.delete(
+    "/provider-keys/{provider}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+async def revoke_provider_key(
+    provider: str,
+    _admin: AdminUser,
+    gateway: Annotated[GatewayClient, Depends(get_gateway_client)],
+) -> Response:
+    """Revoke a provider's runtime key. 404 / 409 propagate from the gateway.
+
+    Uses the canonical DELETE-204 recipe (``response_class=Response`` plus an
+    explicit empty ``Response`` return) so the 204 carries a genuinely empty
+    body.
+    """
+
+    await gateway.delete_provider_key(provider)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
 # Wave C — RBAC three-role management (PRD §5.2)
 # ---------------------------------------------------------------------------
 
@@ -764,4 +855,96 @@ async def update_user_role(
         email=target.email,
         role=target.role,
         is_admin=target.is_admin,
+    )
+
+
+# ---------------------------------------------------------------------------
+# M3-0.3 / DE-276 — /admin/ingest-health (aggregate ingest status)
+# ---------------------------------------------------------------------------
+
+
+class IngestHealthResponse(BaseModel):
+    """Aggregate ingest-status counts across the deployment.
+
+    The four document-level buckets sum to roughly the document count
+    (rows in ``documents``); ``parse_failed`` reports file-level
+    failures (rows in ``files`` with ``ingestion_status='failed'``),
+    which never reach the ``documents`` table.
+
+    Operators use this surface as the canonical "is my ingest healthy?"
+    signal — a non-zero ``embed_failed`` or ``partial`` count is the
+    silent-degrade signal that triggered DE-276; a non-zero
+    ``parse_failed`` count is the operator's cue to inspect specific
+    files via the existing file-list UI.
+    """
+
+    ok: int = Field(description="Documents with all chunks successfully embedded.")
+    embed_failed: int = Field(
+        description=(
+            "Documents whose embed worker raised before any chunk was embedded — "
+            "hybrid retrieval degrades to FTS-only for these."
+        )
+    )
+    partial: int = Field(
+        description=(
+            "Documents whose embed worker raised mid-batch — some chunks have "
+            "vectors, others are NULL. Operators may re-run ingest to recover."
+        )
+    )
+    parse_failed: int = Field(
+        description=(
+            "Files that failed at parse time and never produced a documents row "
+            "(``files.ingestion_status='failed'``)."
+        )
+    )
+    total_documents: int = Field(
+        description="Total rows in the documents table (sum of ok + embed_failed + partial)."
+    )
+
+
+@router.get("/ingest-health", response_model=IngestHealthResponse)
+async def get_ingest_health(
+    _admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> IngestHealthResponse:
+    """GET /api/v1/admin/ingest-health — aggregate ingest-status counts (admin-only).
+
+    The endpoint is read-only and stateless. Two queries: one grouped
+    aggregate over ``documents.ingest_status``, one filtered count over
+    ``files.ingestion_status``. Soft-deleted rows are excluded from
+    both (the operator is asking about the live deployment surface, not
+    historical state).
+    """
+
+    # Document-level statuses (M3-0.3 / DE-276 surface).
+    doc_status_stmt = (
+        select(DocumentORM.ingest_status, func.count())
+        .select_from(DocumentORM)
+        .join(FileORM, DocumentORM.file_id == FileORM.id)
+        .where(FileORM.deleted_at.is_(None))
+        .group_by(DocumentORM.ingest_status)
+    )
+    doc_status_rows = (await db.execute(doc_status_stmt)).all()
+    by_status: dict[str, int] = {row[0]: int(row[1]) for row in doc_status_rows}
+
+    ok_count = by_status.get("ok", 0)
+    embed_failed_count = by_status.get("embed_failed", 0)
+    partial_count = by_status.get("partial", 0)
+    total_documents = ok_count + embed_failed_count + partial_count
+
+    # File-level parse failures (existing M1 surface — surfaced here so
+    # operators get a single ingest-health summary instead of two).
+    parse_failed_stmt = (
+        select(func.count())
+        .select_from(FileORM)
+        .where(FileORM.ingestion_status == "failed", FileORM.deleted_at.is_(None))
+    )
+    parse_failed_count = int((await db.execute(parse_failed_stmt)).scalar_one())
+
+    return IngestHealthResponse(
+        ok=ok_count,
+        embed_failed=embed_failed_count,
+        partial=partial_count,
+        parse_failed=parse_failed_count,
+        total_documents=total_documents,
     )

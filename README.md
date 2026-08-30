@@ -9,7 +9,7 @@
 
 LQ.AI is a self-hosted AI platform purpose-built for legal teams. It delivers conversational chat with persistent history and matter-scoped projects, character-verifiable citations against source documents (M2's four-stage Citation Engine), a privacy-preserving anonymization layer for cloud inference (M2), reusable workflow skills authored in the open [agentskills.io / Anthropic Claude Skills](https://github.com/anthropics/skills) format, and a curated library of starter skills for the everyday work lawyers actually do — running on a laptop, an internal server, or a cloud VM, against the customer's choice of model (Anthropic, OpenAI, Azure OpenAI, or local Ollama out of the box), with zero license fees.
 
-Playbooks (codified legal positions for automated contract review), a Microsoft Word add-in, multi-document tabular review, and a Slack/Teams light-intake bridge are committed for M3. The Autonomous Layer (background agents) and Contract Repository (relationship graph over contract sets) are committed for M4. See [Project status](#project-status) below for the current shipped-vs-roadmap split.
+Playbooks (codified legal positions for automated contract review) and multi-document tabular review shipped in M3, alongside a Microsoft Word add-in (installable/authenticated scaffold) and a Slack/Teams light-intake bridge (plumbing). The Autonomous Layer (opt-in background agents under hard brakes) shipped in M4; the Contract Repository relationship graph remains roadmap. See [Project status](#project-status) below for the current shipped-vs-roadmap split.
 
 The project's reason for existing is simple: **legal teams should not have to choose between AI assistance and data sovereignty.** Every other capable tool in this category is a closed-source SaaS that requires sending privileged information to a third-party vendor. LQ.AI runs in your environment, with your keys, against your choice of model — including fully air-gapped deployments using local inference.
 
@@ -37,7 +37,7 @@ The trust model for a self-hosted, open-source legal AI product is structurally 
 
 LQ.AI ships with a curated set of capabilities calibrated to legal work. The capability set in v1 (M1–M4):
 
-**Conversational core with persistent history.** Multi-turn chat organized in a sidebar, with skills and files attached per chat. Search across all chat history. Streaming responses with markdown rendering. Export to Markdown, plain text, or DOCX.
+**Conversational core with persistent history.** Multi-turn chat organized in a sidebar, with skills and files attached per chat. Individual messages can also attach files for that turn only via `file_ids` (the applied set is echoed back as `applied_file_ids`). Search across all chat history. Streaming responses with markdown rendering. Export to Markdown, plain text, or DOCX.
 
 **Skill Library.** Reusable structured prompt artifacts in the [agentskills.io / Anthropic Claude Skills format](https://github.com/anthropics/skills) — a folder containing `SKILL.md` (with YAML frontmatter) and optional supporting files. Three tiers: built-in skills (ship with the product), user skills (you create), and shared skills (your team or org shares). Every active skill is one click away from being readable, debuggable, and forkable. The Skill Creator is itself a skill — a meta-skill you invoke to build new skills via conversation.
 
@@ -58,17 +58,17 @@ The chat UI renders citations as four visual states: green (exact / tolerant mat
 
 **Audit log.** Append-only `audit_log` table records every state-changing action with first-class columns for `privilege_marked`, `privilege_basis`, `routed_inference_tier`, `routed_provider`, plus a JSONB `details` field for action-specific context. Admin-gated `GET /admin/audit-log` endpoint supports filtering by user, resource, action, privilege, tier, and timestamp range; paginated for large windows. Privileged-matter compliance evidence is one query: `?privilege_marked=true&from_timestamp=...&to_timestamp=...`. Cross-references to the gateway's `inference_routing_log` (which records `anonymization_applied`, latency, cost estimate, and request correlation id) via `request_id` for end-to-end pipeline audit. See [`docs/procurement/sig-lite.md`](docs/procurement/sig-lite.md) for the procurement-team-facing audit posture.
 
-**Files / Knowledge Bases.** Persistent collections of documents accessible across chats. Hybrid retrieval combining vector similarity (text-embedding-3-small or operator-configured embedding model via pgvector) with Postgres full-text search; the per-KB `hybrid_alpha` slider tunes the vector/FTS weight at retrieval time. Document ingestion uses Docling for layout-aware parsing of complex PDFs (multi-column, tables, footnotes) with PyMuPDF as the fast path for simpler documents, plus PaddleOCR for scanned-PDF fallback. Character-level offsets land in `documents.normalized_content` for the Citation Engine to verify against. KB-attached chats automatically retrieve before each turn, prepend a citation-formatted context block, and write a `📎 KB retrieval` audit row visible in Receipts.
+**Files / Knowledge Bases.** Persistent collections of documents accessible across chats. Hybrid retrieval combining vector similarity (text-embedding-3-small or operator-configured embedding model via pgvector) with Postgres full-text search; the per-KB `hybrid_alpha` slider tunes the vector/FTS weight at retrieval time. Document ingestion uses Docling for layout-aware parsing of complex PDFs (multi-column, tables, footnotes) with PyMuPDF as the fast path for simpler documents. (Scanned-PDF OCR is not yet implemented — the pipeline parses text-bearing PDFs only and sets `was_ocrd=false`; OCR is tracked as DE-320.) Character-level offsets land in `documents.normalized_content` for the Citation Engine to verify against. KB-attached chats automatically retrieve before each turn, prepend a citation-formatted context block, and write a `📎 KB retrieval` audit row visible in Receipts.
 
 **Enhance Prompt.** A prompt-rewriting skill that runs as an optional pre-step. You type a short, natural-language question; Enhance Prompt expands it into a structured legal prompt (role, jurisdiction, audience, scope, output format, constraints, citation expectations) and shows you the expanded version before submission. The skill itself is inspectable — you can read the SKILL.md driving the enhancement at any time.
 
-**Playbooks (M3).** Codified legal positions for automated contract review. Easy Playbook auto-generation wizard drafts a Playbook from prior agreements. Four built-in playbooks ship in M3: Generic SaaS MSA, NDA, DPA (GDPR-aligned), Commercial MSA.
+**Playbooks (M3, shipped).** Codified legal positions for automated contract review — a LangGraph executor (retrieve → classify → redline → compile) plus an Easy Playbook auto-generation wizard that drafts a Playbook from prior agreements. Five built-in playbooks are seeded: NDA — Mutual, NDA — Unilateral, MSA — SaaS, MSA — Commercial-Purchase, DPA — GDPR. Per-position assessments carry the verbatim matched clause text; full Citation-Engine verification for the playbook executor is deferred. See [`docs/playbooks.md`](docs/playbooks.md).
 
-**Word Add-In (M3).** Microsoft Office.js add-in that brings LQ.AI capabilities directly into Word. Run skills, execute Playbooks, get redlines as Word tracked changes, get comments as Word comments, and ask questions about the document with citations to specific clauses — without leaving Word.
+**Word Add-In (M3, plumbing shipped).** A Microsoft Office.js task pane add-in installable via the unsigned-manifest path (Microsoft 365 Admin Center), authenticated against your deployment with a version handshake. The three in-pane tabs render deep-link cards to the web app today; the substantive in-pane feature surface (run skills, execute Playbooks, redlines-as-tracked-changes, comments, document Q&A) is deferred ([DE-287](docs/PRD.md#9-deferred-enhancements-and-identified-future-work), community-friendly), and the signed/distributed manifest is community-led ([DE-295](docs/PRD.md#9-deferred-enhancements-and-identified-future-work)). See [`docs/word-addin.md`](docs/word-addin.md).
 
-**Tabular / Multi-Document Review (M3).** Structured grid output across N documents — bulk document analysis with citation-grounded cells. "Show me the term length, survival period, carveouts, and governing law for each of these 30 NDAs."
+**Tabular / Multi-Document Review (M3, shipped).** Structured grid output across N documents — a row per document, a column per question — with per-cell grounding chunks and XLSX/CSV export. "Show me the term length, survival period, carveouts, and governing law for each of these 30 NDAs." Per-cell citations are navigable: the read-side resolves each cell's grounding chunk to its source file, page, and text so the UI can jump to the source. (Executor-minted Citation-Engine provenance remains deferred — [DE-309](docs/PRD.md#9-deferred-enhancements-and-identified-future-work).) Per-column ensemble verification is now honored at execution. See [`docs/tabular-review.md`](docs/tabular-review.md).
 
-**Slack / Teams Light Intake Bridge (M3).** A `/lq` slash command lets a Slack or Teams user forward a thread to an LQ.AI chat or run a quick skill in-thread. Light intake, deliberately not full triage/SLA/approvals — that is Streamline AI's category.
+**Slack / Teams Light Intake Bridge (M3, plumbing shipped).** Standalone `slack-bridge` + `teams-bridge` services (opt-in Compose profiles) with OAuth install + identity binding + an admin management surface. The webhook handlers are signature-verified but the `/lq` slash-command quick-skill surface is inert/deferred ([DE-288](docs/PRD.md#9-deferred-enhancements-and-identified-future-work), community-friendly); a real OAuth round-trip against a public tunnel has not yet been exercised end-to-end ([DE-312](docs/PRD.md#9-deferred-enhancements-and-identified-future-work)). Light intake, deliberately not full triage/SLA/approvals — that is Streamline AI's category. See [`docs/intake-bridges.md`](docs/intake-bridges.md).
 
 **Anonymization Layer (M2).** Pre-processing step in the Inference Gateway that pseudonymizes sensitive entities (names, organizations, addresses, email addresses, phone numbers, case numbers, matter numbers) before requests leave for the model provider; rehydrates pseudonyms back to originals on the response path. Built on [Presidio](https://github.com/microsoft/presidio) + spaCy + two custom legal recognizers (`CaseNumberRecognizer`, `MatterNumberRecognizer`) that catch legal-specific identifiers the default Presidio config misses. Per-request `PseudonymMapper` is in-memory only — never persisted, never logged, dropped on function exit.
 
@@ -78,13 +78,13 @@ The privacy fallback for Tier 3+ inference when local (Tier 1) is impractical bu
 
 **Honest validation posture.** The custom recognizers, middleware integration, round-trip correctness, and edge cases are exercised by ~24 unit + integration tests. The Presidio default-recognizer recall and precision **on legal-document corpus specifically** is empirically unmeasured — Presidio's published metrics target general English (news, social media), not legal prose. A recognizer miss is a silent confidentiality incident (unlike citation misses, which surface in the UI as "unverified"). Operators with high-confidentiality requirements should read [`docs/security/anonymization.md` §"What's validated vs what's unvalidated"](docs/security/anonymization.md#whats-validated-vs-whats-unvalidated) and consider Tier 1 (Ollama local) routing for matters where the unvalidated risk is unacceptable. Empirical validation on a curated legal-document corpus is welcomed as a community contribution — the bounded scope is documented at [PRD §9 / DE-282](docs/PRD.md#de-282--anonymization-layer-empirical-validation-on-legal-document-corpus). We win by being honest about where to trust and where to be careful, not by overclaiming.
 
-**Autonomous Layer (M4).** Long-running per-user agents that observe activity, learn patterns, take proactive actions. Cron-scheduled tasks; watches that trigger on KB changes or document arrivals; per-user persistent memory store with user-curation UI.
+**Autonomous Layer (M4, shipped).** Opt-in (off by default) background per-user agents that do real in-loop work under hard brakes. A five-phase executor (intake → analysis → drafting → ethics_review → delivery) routes every external action through a single `guarded_tool_call` chokepoint enforcing three brakes: R4 (per-session and per-trigger cost cap), R5 (external halt + idle watchdog), and R6 (phase-gated tool grants). Four primitives ship: watches that trigger on KB changes, in-repo cron schedules, a per-user memory store with a curation UI, and a precedent board. Each session produces an honest per-session receipt (`terminal_reason`: completed / cost_cap_reached / external_halt), surfaced in a web dashboard. Sessions persist their findings for later review, and opted-in runs (default off) can emit markdown documents directly into the target knowledge base. The ethics-review phase is a light v1. See [`docs/autonomous-layer.md`](docs/autonomous-layer.md).
 
-**Contract Repository — Auto-Relationship Detection (M4).** Pipeline that produces a relationship graph over a Knowledge Base of contracts: amendments, restatements, references, master/sub. When you ask "which liability cap actually governs?", the system uses the graph to determine the operative document chain.
+**Contract Repository — Auto-Relationship Detection (roadmap).** A planned pipeline that produces a relationship graph over a Knowledge Base of contracts (amendments, restatements, references, master/sub) to determine the operative document chain. **Not yet built** — there is no `contract_relationships` table in source today; tracked as M4-roadmap / community work.
 
 **Forward-looking (M5–M7, community-driven).** Workflow-aware context layer that integrates email, calendar, task systems, and document stores via [MCP (Model Context Protocol)](https://modelcontextprotocol.io); a Workspace Concierge that produces ranked Today views with rationales; agent dispatch with human-in-the-loop guardrails. See [PRD §8.5](docs/PRD.md#m5m7--forward-looking-workflow-intelligence-community-driven-not-committed) for the trajectory.
 
-The full capability specification is in [PRD §3](docs/PRD.md#3-capability-specifications). Some capabilities described above are deferred to M3 (Playbooks, Word Add-In, Tabular Review, Slack/Teams) or M4 (Autonomous Layer, Contract Repository) — see [HONEST-STATE.md](docs/HONEST-STATE.md) for the current shipped-vs-deferred catalog with verification paths for every row.
+The full capability specification is in [PRD §3](docs/PRD.md#3-capability-specifications). M3 shipped Playbooks and Tabular Review end-to-end, with the Word Add-In and Slack/Teams bridges as plumbing/scaffold (richer surfaces deferred — see each capability doc + the linked DEs). M4 shipped the Autonomous Layer end-to-end; the Contract Repository relationship graph remains roadmap. See [HONEST-STATE.md](docs/HONEST-STATE.md) for the current shipped-vs-deferred catalog with verification paths for every row.
 
 ---
 
@@ -167,7 +167,7 @@ Generate all four at once, labelled and ready to paste into `.env`:
 python3 -c 'import secrets; [print(f"{name}={secrets.token_urlsafe(32)}") for name in ("POSTGRES_PASSWORD","MINIO_ROOT_PASSWORD","LQ_AI_GATEWAY_KEY","JWT_SECRET")]'
 ```
 
-Provider API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are optional at this step. The stack starts without any; inference calls return "no provider configured" until you add at least one and restart the gateway.
+Provider API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are optional at this step. The stack starts without any; inference calls return "no provider configured" until you add at least one. Two paths add a key: set it in `.env` and restart the gateway, or — once `LQ_AI_GATEWAY_MASTER_KEY` is configured — add it at runtime through the admin provider-keys surface (`/api/v1/admin/provider-keys`), which encrypts the key into `gateway.yaml` and hot-applies it to the live gateway with no restart.
 
 ### Step 2 — Start the stack
 
@@ -175,10 +175,10 @@ Provider API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are optional at this s
 docker compose up -d
 ```
 
-Seven services start: postgres, redis, minio, gateway, api, ingest-worker, web. The api container runs `alembic upgrade head` automatically as the first step of its entrypoint, so a fresh deployment lands a fully-migrated schema before uvicorn accepts traffic. Wait ~60 seconds for healthchecks, then confirm:
+Eight services start: postgres, redis, minio, gateway, api, ingest-worker, arq-worker, web. The api container runs `alembic upgrade head` automatically as the first step of its entrypoint, so a fresh deployment lands a fully-migrated schema before uvicorn accepts traffic (the arq-worker and ingest-worker skip migrations and wait for the api to be healthy). Wait ~60 seconds for healthchecks, then confirm:
 
 ```bash
-docker compose ps   # all 7 services should show "healthy" or "running"
+docker compose ps   # all 8 services should show "healthy" or "running"
 ```
 
 > **First-run admin password.** On the first start (and only the first start), the api container's startup logs an auto-generated admin password — a one-time secret you can use if you skip Step 3. Grep `docker compose logs api` for `First-run admin password` to retrieve it. Most operators ignore this and just run Step 3 below, which sets a known password directly.
@@ -216,7 +216,7 @@ Inference Gateway:  http://localhost:8001/docs
 
 After login you land on the LQ.AI home. Three good starting points:
 
-- Click **Learn** in the top bar to take the interactive tour — six playgrounds walk through the architecture, the request lifecycle, the tier system, what the model sees, where your data lives, and how to author a skill. This is the fastest orientation for both evaluators and new contributors. (`http://localhost:3000/lq-ai/learn`)
+- Click **Learn** in the top bar to take the interactive tour — eleven playgrounds walk through the architecture, the request lifecycle, the tier system, what the model sees, where your data lives, and how to author a skill. This is the fastest orientation for both evaluators and new contributors. (`http://localhost:3000/lq-ai/learn`)
 - Click **Skills** to browse the 10 built-in skills. Each is inspectable: click any skill to read the `SKILL.md` driving it.
 - Click **+ New matter** to create your first project workspace and attach a document to try a skill against.
 
@@ -228,7 +228,7 @@ LQ.AI ships with four provider adapters: **Anthropic** (Claude), **OpenAI** (GPT
 
 Multiple providers can run in parallel: operators declare `model_aliases` in `gateway.yaml` that resolve to specific provider+model pairs with fallback chains. A request for `smart` might primary-route to `anthropic-prod/claude-opus-4-7` and fall back to `vertex-anthropic/claude-opus-4-7@anthropic` on failure; the routing log captures which target actually handled the request. Provider keys are encrypted at rest in the gateway (Fernet AES-128-CBC + HMAC-SHA256 per `gateway/app/secrets.py`); the api/ service never sees them — defense-in-depth around the highest-value secret in the deployment.
 
-For a **fully air-gapped deployment** (no outbound network calls), start the stack with the `local` profile to add Ollama and PaddleOCR sidecars:
+For a **fully air-gapped deployment** (no outbound network calls), start the stack with the `local` profile to add the Ollama sidecar for local inference:
 
 ```bash
 docker compose --profile local up -d
@@ -242,11 +242,11 @@ In this mode, inference runs entirely on the local host via Ollama. The Inferenc
 
 **`docker compose up` fails immediately** — confirm Docker Desktop is running and has at least 6 GB RAM allocated. On macOS: Docker Desktop → Settings → Resources. Also confirm all four required `.env` variables are set (the compose file requires them and will exit with an error message naming the missing variable).
 
-**Fewer than 7 services are healthy** — wait 60 seconds; the postgres healthcheck can take time on first boot. If services are still unhealthy after that: `docker compose logs <service-name>` to see what is failing.
+**Fewer than 8 services are healthy** — wait 60 seconds; the postgres healthcheck can take time on first boot. If services are still unhealthy after that: `docker compose logs <service-name>` to see what is failing.
 
 **Login rejected / password not accepted** — re-run step 3 (the reset command is idempotent). Confirm you are using the login URL `http://localhost:3000/lq-ai/login`, not `http://localhost:3000`.
 
-**Inference returns "no provider configured"** — add at least one provider key to `.env` (e.g., `ANTHROPIC_API_KEY=sk-...`), then `docker compose restart gateway`. The gateway reads provider keys from environment variables at startup.
+**Inference returns "no provider configured"** — add at least one provider key. Either set it in `.env` (e.g., `ANTHROPIC_API_KEY=sk-...`) and `docker compose restart gateway` (the gateway reads environment provider keys at startup), or, with `LQ_AI_GATEWAY_MASTER_KEY` set, add it at runtime via the admin provider-keys surface (`/api/v1/admin/provider-keys`), which hot-applies without a restart.
 
 **A host port is already in use** (`bind: address already in use`) — every host-side port the stack uses is configurable via a `*_HOST_PORT` variable in `.env` (the compose file reads them; see `docker-compose.yml`). Override the colliding port and `docker compose up -d` again. The defaults shipped in `.env.example`:
 
@@ -274,17 +274,17 @@ The trust model for a self-hosted, open-source project is that every claim termi
 - **Inference Gateway:** `gateway/app/router.py` — the only egress point, the security boundary, the place where routing decisions are made and logged.
 - **Audit log writer:** `api/app/audit.py` — what gets written to the `audit_log` table, and for which actions.
 - **Honest catalog:** [`docs/HONEST-STATE.md`](docs/HONEST-STATE.md) — the shipped-vs-deferred table with a verification path for every row. If you find a discrepancy between this document and the code, the code is canonical.
-- **Interactive architecture tour:** Navigate to `http://localhost:3000/lq-ai/learn` after logging in. The six playgrounds each point at the relevant source files for that topic.
+- **Interactive architecture tour:** Navigate to `http://localhost:3000/lq-ai/learn` after logging in. The eleven playgrounds each point at the relevant source files for that topic.
 
 ---
 
 ### First steps after login
 
-**The Learn page is the guided tour.** New users and procurement evaluators start at `http://localhost:3000/lq-ai/learn`. Six interactive playgrounds walk through the architecture, the full request lifecycle, the five-tier inference model, what the model actually sees (and what it doesn't), where data lives, and how to author your own skill. Each playground links to the relevant source file.
+**The Learn page is the guided tour.** New users and procurement evaluators start at `http://localhost:3000/lq-ai/learn`. Eleven interactive playgrounds walk through the architecture, the full request lifecycle, the five-tier inference model, what the model actually sees (and what it doesn't), where data lives, and how to author your own skill. Each playground links to the relevant source file.
 
 **The honest catalog.** [`docs/HONEST-STATE.md`](docs/HONEST-STATE.md) names what is shipped, what is deferred, and how to verify each. We publish this because the verification path for an open-source product terminates in code, not in claims. If anything in this README is inconsistent with what the code does, please [open an issue](https://github.com/LegalQuants/lq-ai/issues) — the code is canonical.
 
-**Want to contribute?** [`docs/contribute/EASIEST-CONTRIBUTIONS.md`](docs/contribute/EASIEST-CONTRIBUTIONS.md) is the curated list of short-cycle contributions where the foundation is already in source and the gap is written down in advance. Seven items are currently open, ranging from "a practicing attorney with no engineering background can pick this up" to "a security architect familiar with OWASP can pick this up." Each mini-PRD names the acceptance criteria, the contributor profile, and the files to start in.
+**Want to contribute?** [`docs/ROADMAP.md`](docs/ROADMAP.md) is the live, ordered punch list of work that has not yet shipped — distilled from PRD §8/§9, HONEST-STATE, and the active milestone plans into one prioritized contributor view, labelled by complexity (🟢/🟡/🔴), effort (S/M/L), and contributor profile (engineer / attorney / security / DevOps). For the curated short-cycle subset where the foundation is already in source and the gap is written down in advance, see [`docs/contribute/EASIEST-CONTRIBUTIONS.md`](docs/contribute/EASIEST-CONTRIBUTIONS.md) — currently seven items, ranging from "a practicing attorney with no engineering background can pick this up" to "a security architect familiar with OWASP can pick this up." Each mini-PRD names the acceptance criteria, the contributor profile, and the files to start in.
 
 ---
 
@@ -384,7 +384,7 @@ Accessibility findings are treated as defects, not nice-to-haves. If you find on
 
 ## Project status
 
-**M1 and M2 shipped; M3 next.** The PRD is at v0.2; ten starter skills are authored and shipping; the Citation Engine's four-stage verification cascade is operational (exact → tolerant → paraphrase judge → ensemble); the Anonymization Layer is wired end-to-end with custom legal recognizers, streaming-aware rehydration, privileged-project carve-out, and a retrieval-context skip for direct citation grounding; the Azure OpenAI adapter rounds out the M2 provider set. Active work toward M3.
+**M1 through M4 shipped.** The PRD is at v0.2; ten starter skills are authored and shipping; the Citation Engine's four-stage verification cascade is operational (exact → tolerant → paraphrase judge → ensemble); the Anonymization Layer is wired end-to-end with custom legal recognizers, streaming-aware rehydration, privileged-project carve-out, and a retrieval-context skip for direct citation grounding; the Azure OpenAI adapter rounds out the provider set. M3 shipped Playbooks and Tabular Review end-to-end, plus the Word add-in (installable scaffold) and Slack/Teams intake bridge (plumbing). M4 shipped the opt-in Autonomous Layer end-to-end — a five-phase executor under hard cost/halt/phase-gate brakes. The remaining roadmap items (in-Word feature surfaces, live-verified chat-platform intake, the Contract Repository relationship graph, and the MCP-client subsystem) are listed with verification paths in [HONEST-STATE.md](docs/HONEST-STATE.md).
 
 **Roadmap:**
 
@@ -392,11 +392,11 @@ Accessibility findings are treated as defects, not nice-to-haves. If you find on
 |---|---|---|
 | **M1 — Foundation** | Working self-hostable release with 10 starter skills, Projects, Organization Profile, Inference Tier Awareness, hybrid retrieval, Compliance Alignment Pack, Code & Supply-Chain Transparency, MFA option, per-user export/delete | ✓ **Shipped** |
 | **M2 — Citation Engine and Anonymization** | Four-stage Citation Engine (exact / tolerant / paraphrase judge / ensemble) with character-level fidelity, audit-pinned privacy envelope on ensemble runs; Anonymization Layer in the Gateway with custom legal recognizers + streaming rehydration + privileged-project skip + retrieval-context skip; Azure OpenAI provider adapter | ✓ **Shipped** |
-| **M3 — Playbooks, Word Add-In, Tabular Review, Slack/Teams** | Codified legal positions for automated contract review; Microsoft Office.js add-in (run skills, get redlines as Word tracked changes, get comments as Word comments); structured grid output across N documents with citation-grounded cells; Slack/Teams `/lq` slash command for light intake | **Next** (~8 weeks) |
-| M4 — Autonomous Layer and Contract Repository | Background agents, watches, scheduled tasks; relationship graph over contract sets (amendments, restatements, master/sub) | After M3 (~8 weeks) |
+| **M3 — Playbooks, Tabular Review, Word Add-In, Slack/Teams** | Codified legal positions for automated contract review (shipped end-to-end); structured grid output across N documents with citation-grounded cells (shipped); Microsoft Office.js add-in shipped as an installable/authenticated scaffold, with in-Word feature surfaces (run skills, Word tracked changes/comments) deferred; Slack/Teams bridges shipped as plumbing/OAuth, with the `/lq` slash-command surface inert and live OAuth round-trip unverified | ✓ **Shipped** (with caveats) |
+| **M4 — Autonomous Layer** | Opt-in background per-user agents (off by default): five-phase executor through a single guarded chokepoint under cost/halt/phase-gate brakes; watches, schedules, per-user memory, precedent board; honest per-session receipts; web dashboard. The Contract Repository relationship graph remains roadmap (not built) | ✓ **Shipped** (autonomous layer; contract graph deferred) |
 | M5–M7 — Forward-Looking Workflow Intelligence | Community-driven; not committed. MCP-client subsystem operationalized; Signal Aggregation Service; Today view with prioritization; agent execution framework with human-in-the-loop guardrails. | TBD |
 
-For the full roadmap and the ~50+ deferred enhancements ready for community contribution, see [PRD §8 Roadmap](docs/PRD.md#8-roadmap) and [§9 Deferred Enhancements](docs/PRD.md#9-deferred-enhancements-and-identified-future-work).
+For the full ordered punch list of unshipped work — across the active milestone, PRD-committed deferrals, contributor-ready mini-PRDs, engineering discipline, compliance, and forward-looking M5+ — see **[`docs/ROADMAP.md`](docs/ROADMAP.md)**. The underlying sources of truth are [PRD §8 Roadmap](docs/PRD.md#8-roadmap) and [§9 Deferred Enhancements](docs/PRD.md#9-deferred-enhancements-and-identified-future-work); the roadmap doc threads ~150 entries into one prioritized view.
 
 ---
 
@@ -409,7 +409,7 @@ Two contribution paths, with separate contribution guides:
 - **Code, infrastructure, deployment recipes, documentation:** see [`CONTRIBUTING.md`](CONTRIBUTING.md). DCO sign-off required (no CLA), code style enforced by `ruff` + `mypy` (Python) and Prettier + ESLint (JS), pytest coverage target 80%.
 - **Skills (the canonical artifact of value in this project):** see [`skills/CONTRIBUTING.md`](skills/CONTRIBUTING.md). Skills containing legal substance require attestation that the substantive content is accurate to the contributor's knowledge and review by at least one practicing attorney plus one engineer. The skill-authoring guide ([`docs/skill-authoring-guide.md`](docs/skill-authoring-guide.md)) documents the patterns established by the M1 starter skills — perspective branching, severity rubrics, optional-input design, output-format conventions.
 
-For the curated set of short-cycle contributions where the foundation is already in source and the scope is written down in advance, start with [`docs/contribute/EASIEST-CONTRIBUTIONS.md`](docs/contribute/EASIEST-CONTRIBUTIONS.md) — each entry has a mini-PRD in [`docs/contribute/mini-prds/`](docs/contribute/mini-prds/) covering contributor profile, what ships, acceptance criteria, and where to start.
+For the full picture of what's open, start with [`docs/ROADMAP.md`](docs/ROADMAP.md) — the live, ordered punch list across active milestone work, PRD-committed deferrals, mini-PRDs, engineering discipline, compliance, and forward-looking M5+, each entry labelled by complexity and contributor profile. For the curated short-cycle subset where the foundation is already in source and the scope is written down in advance, see [`docs/contribute/EASIEST-CONTRIBUTIONS.md`](docs/contribute/EASIEST-CONTRIBUTIONS.md) — each entry has a mini-PRD in [`docs/contribute/mini-prds/`](docs/contribute/mini-prds/) covering contributor profile, what ships, acceptance criteria, and where to start.
 
 A few things that are easy and meaningful for first contributions:
 
@@ -460,6 +460,7 @@ For security disclosures, see [`SECURITY.md`](SECURITY.md). The disclosure proce
 
 - [Product Requirements Document](docs/PRD.md) — the canonical specification (v0.2).
 - [`docs/HONEST-STATE.md`](docs/HONEST-STATE.md) — shipped-vs-deferred catalog with verification paths for every claim.
+- [`docs/observability.md`](docs/observability.md) — OpenTelemetry traces/metrics, deployment recipes, operator guide.
 - [`docs/contribute/EASIEST-CONTRIBUTIONS.md`](docs/contribute/EASIEST-CONTRIBUTIONS.md) — curated short-cycle contributions with mini-PRDs.
 - [`docs/skill-authoring-guide.md`](docs/skill-authoring-guide.md) — how to write a high-quality skill.
 - [`docs/playbook-authoring-guide.md`](docs/playbook-authoring-guide.md) — how to write a Playbook.

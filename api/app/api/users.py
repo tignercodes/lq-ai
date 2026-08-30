@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -103,6 +103,57 @@ class UserPreferencesUpdate(BaseModel):
     workspace_layout: WorkspaceLayout | None = None
     trust_pills: TrustPills | None = None
     provenance_pills: ProvenancePills | None = None
+    # M4-C2 — Autonomous Layer opt-in (off by default)
+    autonomous_enabled: bool | None = None
+
+
+# Cap for ``display_name``. The ``users.display_name`` column is an
+# unbounded Postgres ``String`` (TEXT) — there is no DB length to mirror,
+# so we pick a sane application-layer cap here. 200 matches the project
+# name cap used elsewhere in the API surface (Project.name maxLength).
+_DISPLAY_NAME_MAX_LEN = 200
+
+
+class UserProfileUpdate(BaseModel):
+    """PATCH body for ``/users/me`` — edit the caller's own profile.
+
+    Currently scoped to ``display_name`` only. Email self-service editing
+    is intentionally **out of scope** for this surface: changing the login
+    email pulls in re-verification, MFA, and uniqueness concerns that are
+    auth-adjacent and warrant their own dedicated flow. ``display_name``
+    alone unblocks the editable-profile experience.
+
+    Validation (mirrors how ``UserPreferencesUpdate`` constrains its
+    fields, but for a free-text field):
+
+    * ``display_name`` is optional — omitting it means "no change".
+    * When supplied, leading/trailing whitespace is trimmed and the result
+      must be non-empty (empty or whitespace-only → 422).
+    * The trimmed value must be at most ``_DISPLAY_NAME_MAX_LEN`` chars
+      (over-length → 422).
+    * At least one updatable field must be present; since ``display_name``
+      is the only field today, an all-omitted body → 422 ("no fields to
+      update").
+    """
+
+    display_name: str | None = None
+
+    @model_validator(mode="after")
+    def _validate(self) -> UserProfileUpdate:
+        # ``display_name`` is the only updatable field; an omitted body is
+        # a no-op PATCH with nothing to do, which we reject as 422.
+        if self.display_name is None:
+            raise ValueError("no fields to update")
+
+        trimmed = self.display_name.strip()
+        if not trimmed:
+            raise ValueError("display_name must not be empty or whitespace-only")
+        if len(trimmed) > _DISPLAY_NAME_MAX_LEN:
+            raise ValueError(f"display_name must be at most {_DISPLAY_NAME_MAX_LEN} characters")
+
+        # Persist the trimmed value so callers can't smuggle padding in.
+        self.display_name = trimmed
+        return self
 
 
 class UserPreferencesResponse(BaseModel):
@@ -118,6 +169,8 @@ class UserPreferencesResponse(BaseModel):
     workspace_layout: WorkspaceLayout
     trust_pills: TrustPills
     provenance_pills: ProvenancePills
+    # M4-C2 — Autonomous Layer opt-in (off by default)
+    autonomous_enabled: bool
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +194,60 @@ async def get_me(user: CurrentUser) -> UserPublic:
     return UserPublic.from_user(user)
 
 
+@router.patch(
+    "/me",
+    response_model=UserPublic,
+    summary="Update the calling user's own profile (display_name)",
+)
+async def patch_me(
+    payload: UserProfileUpdate,
+    request: Request,
+    user: ActiveUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> UserPublic:
+    """PATCH /api/v1/users/me — edit the caller's own profile.
+
+    Caller-scoped: mutates only the authenticated user's own row; no user
+    id is ever accepted from the path or body. Currently updates
+    ``display_name`` only (trimmed, non-empty, length-guarded by
+    ``UserProfileUpdate``). Email self-service editing is intentionally
+    out of scope (re-verification / MFA / uniqueness).
+
+    Writes a ``user.profile_updated`` audit row enumerating the changed
+    fields, mirroring ``patch_me_preferences``. Returns the updated
+    ``UserPublic`` — the same shape ``GET /users/me`` returns.
+    """
+
+    from app.models.user import User as UserORM  # local — only writer needs it
+
+    row = await db.get(UserORM, user.id)
+    if row is None:  # pragma: no cover — dependency would have already 401d
+        raise HTTPException(status_code=404, detail="user not found")
+
+    changed_fields: list[str] = []
+    # ``display_name`` is guaranteed present + trimmed + non-empty by the
+    # model validator (omitted/empty bodies 422 before we get here).
+    assert payload.display_name is not None
+    if row.display_name != payload.display_name:
+        row.display_name = payload.display_name
+        changed_fields.append("display_name")
+
+    if changed_fields:
+        await audit_action(
+            db,
+            user_id=row.id,
+            action="user.profile_updated",
+            resource_type="user",
+            resource_id=str(row.id),
+            request=request,
+            details={"fields": changed_fields},
+        )
+        await db.commit()
+        await db.refresh(row)
+
+    return UserPublic.from_user(row)
+
+
 @router.get(
     "/me/preferences",
     response_model=UserPreferencesResponse,
@@ -160,6 +267,7 @@ async def get_me_preferences(user: ActiveUser) -> UserPreferencesResponse:
         workspace_layout=getattr(user, "workspace_layout", "three_pane"),
         trust_pills=getattr(user, "trust_pills", "labels"),
         provenance_pills=getattr(user, "provenance_pills", "always"),
+        autonomous_enabled=getattr(user, "autonomous_enabled", False),
     )
 
 
@@ -235,6 +343,13 @@ async def patch_me_preferences(
             row.provenance_pills = after
             changed["provenance_pills"] = {"before": before, "after": after}
 
+    if payload.autonomous_enabled is not None:
+        before = str(row.autonomous_enabled)
+        after = str(payload.autonomous_enabled)
+        if before != after:
+            row.autonomous_enabled = payload.autonomous_enabled
+            changed["autonomous_enabled"] = {"before": before, "after": after}
+
     if not changed:
         return UserPreferencesResponse(
             reasoning_visibility=row.reasoning_visibility,
@@ -242,6 +357,7 @@ async def patch_me_preferences(
             workspace_layout=row.workspace_layout,
             trust_pills=row.trust_pills,
             provenance_pills=row.provenance_pills,
+            autonomous_enabled=row.autonomous_enabled,
         )
 
     await audit_action(
@@ -262,6 +378,7 @@ async def patch_me_preferences(
         workspace_layout=row.workspace_layout,
         trust_pills=row.trust_pills,
         provenance_pills=row.provenance_pills,
+        autonomous_enabled=row.autonomous_enabled,
     )
 
 

@@ -98,7 +98,7 @@ sidecar list, with four visual states:
 | `verified-exact` | green | `verification_method='exact_match'` |
 | `verified-tolerant` | green | `verification_method='tolerant_match'` |
 | `verified-paraphrase` | yellow | `verification_method` in (`paraphrase_judge`, `llm_judge`, `ensemble_strict`, `ensemble_majority`) |
-| `unverified` | red | no row, or `verified=false`, or `verification_method='failed'` |
+| `unverified` | grey (greyed text + `[unverified]` tag; dotted grey inline underline) | no row, or `verified=false`, or `verification_method='failed'` |
 
 Per M2-D1 Decision F, Stage 4 ensemble methods render as
 `verified-paraphrase` (yellow). The tooltip varies by method:
@@ -129,6 +129,15 @@ the cascade routes to Stage 4. When the cost estimate exceeds the
 configured cap (`max_cost_per_message_usd`), the cascade falls back
 to Stage 3 with a `chat_message_ensemble_budget_fallback` warning
 logged — the operator's budget setting is a hard cap, not advisory.
+
+4. **Tabular per-column** — a fourth activation path, on the Tabular
+   Review surface (post-v0.4.0, #127). A `table`-mode column's
+   `ensemble_verification` flag (resolved column > skill snapshot >
+   deployment default) runs one Stage-4 ensemble pass per cell over the
+   cell's cited chunks, persisting `verification_method` on the cell.
+   Unlike the chat path, the tabular path has **no** per-cell mid-run
+   cost ceiling (the pre-flight preview is the guard; [DE-331]). See
+   [docs/tabular-review.md](tabular-review.md#per-column-ensemble-verification-post-v040-127).
 
 ## Configuration
 
@@ -336,7 +345,7 @@ If a citation's source quote spans the boundary between two adjacent
 retrieved chunks (i.e., neither chunk alone contains the full quote),
 the extractor's `_locate_in_chunk` returns `None` and the candidate
 is dropped silently. The M2-C2 UI renders the absence as the
-"unverified" red state.
+"unverified" (grey) state.
 
 **Current scope of the bug:** the extractor searches each cited
 chunk's `content` for the quote. The verifier (Stages 1–4) reads
@@ -365,10 +374,10 @@ user-driven document deletion during an in-flight request), the
 verifier's batch-load returns no document for that ID and the
 defensive `if doc is None: continue` guard in `_persist_message_citations`
 skips the candidate silently. No row is persisted; the M2-C2 UI
-renders the marker as "unverified" (red).
+renders the marker as "unverified" (grey).
 
 **The distinction the spec drew:** M2-D4 references a "system-error
-state" — visually distinct from "unverified" (red) — but the M2-C2
+state" — visually distinct from "unverified" (grey) — but the M2-C2
 Decision H deferred the dedicated state-5 rendering to a future
 task. Implementing state-5 means: persist a row with
 `verification_method='failed'` + a details field flagging "source

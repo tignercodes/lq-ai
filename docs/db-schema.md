@@ -43,6 +43,8 @@ CREATE TABLE users (
     workspace_layout      TEXT NOT NULL DEFAULT 'three_pane',  -- CHECK (workspace_layout IN ('three_pane','two_pane','one_pane'))
     trust_pills           TEXT NOT NULL DEFAULT 'labels',      -- CHECK (trust_pills IN ('labels','dots'))
     provenance_pills      TEXT NOT NULL DEFAULT 'always',      -- CHECK (provenance_pills IN ('always','collapsed'))
+    -- M4-C2 (migration 0044) — Autonomous Layer per-user opt-in; off by default.
+    autonomous_enabled    BOOLEAN NOT NULL DEFAULT FALSE,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_login_at         TIMESTAMPTZ,
@@ -64,6 +66,7 @@ CREATE INDEX idx_users_deletion_scheduled ON users(deletion_scheduled_at) WHERE 
 | `workspace_layout` | 0019 | Matter workspace pane count for Wave C: `three_pane`, `two_pane`, `one_pane`. |
 | `trust_pills` | 0019 | Ambient trust label format: `labels` (full text) vs. `dots` (minimal). |
 | `provenance_pills` | 0019 | Per-message skill/tier/provider pill row: `always` visible vs. `collapsed`. |
+| `autonomous_enabled` | 0044 | M4-C2 Autonomous Layer opt-in. `FALSE` by default; the autonomous executor and trigger surfaces are inert for a user until they flip this on. |
 
 `must_change_password` is set to TRUE for:
 - the auto-created first-run admin (Task B2 / migration `0002`),
@@ -246,6 +249,26 @@ ALTER TABLE files
 independently owned by its `owner_id` and may be in other projects via
 the `project_files` join (the `files.project_id` column is the file's
 *primary* project; the join table is the many-to-many relation).
+
+### `project_knowledge_bases` (migration 0021)
+
+Many-to-many join binding knowledge bases to projects (a project can
+surface multiple KBs; a KB can be attached to multiple projects).
+Distinct from `knowledge_bases.project_id`, which is the KB's *primary*
+project; this table is the many-to-many attach relation.
+
+```sql
+CREATE TABLE project_knowledge_bases (
+    project_id           UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,            -- fk_project_knowledge_bases_project_id
+    knowledge_base_id    UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,     -- fk_project_knowledge_bases_kb_id
+    attached_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    attached_by_user_id  UUID REFERENCES users(id) ON DELETE SET NULL,                       -- fk_project_knowledge_bases_attached_by
+    CONSTRAINT pk_project_knowledge_bases PRIMARY KEY (project_id, knowledge_base_id)
+);
+
+CREATE INDEX idx_project_knowledge_bases_kb_id
+    ON project_knowledge_bases (knowledge_base_id);
+```
 
 ---
 
@@ -455,13 +478,95 @@ Candidates that fail Stage 1 are dropped (not persisted) until later
 stages ship; the M2-C2 UI work decides what to render for "model
 emitted but we couldn't verify."
 
+### `enhance_prompt_interactions` (migration 0015)
+
+One row per Enhance Prompt (⌘E) invocation. Records the raw input, the
+expanded output (or the skip reason if expansion did not apply), the
+model's reasoning trace, whether the user used/edited the result, and
+the routing metadata for the enhance call.
+
+```sql
+CREATE TABLE enhance_prompt_interactions (
+    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id                UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,    -- fk_enhance_prompt_interactions_user
+    chat_id                UUID REFERENCES chats(id) ON DELETE SET NULL,            -- fk_enhance_prompt_interactions_chat
+    raw_input              TEXT NOT NULL,
+    expansion_applied      BOOLEAN NOT NULL,
+    expanded_output        TEXT,
+    reasoning              JSONB NOT NULL DEFAULT '[]'::jsonb,
+    skip_reason            TEXT,
+    used                   BOOLEAN NOT NULL DEFAULT FALSE,
+    edited_before_use      BOOLEAN NOT NULL DEFAULT FALSE,
+    routed_inference_tier  INTEGER,
+    routed_provider        TEXT,
+    routed_model           TEXT,
+    prompt_tokens          INTEGER,
+    completion_tokens      INTEGER,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_enhance_prompt_tier_range
+        CHECK (routed_inference_tier IS NULL OR (routed_inference_tier BETWEEN 1 AND 5)),
+    CONSTRAINT chk_enhance_prompt_skip_has_reason
+        CHECK (expansion_applied OR skip_reason IS NOT NULL)
+);
+```
+
+### `work_product_attribution` (migration 0017)
+
+One row per assistant message that constitutes attributable work
+product (PRD §5 work-product attribution). Captures the routing/skill/
+playbook provenance and a content hash so a given output can be tied
+back to the actor, matter, model, and skills that produced it. The
+`message_id` FK is `UNIQUE` — at most one attribution row per message.
+
+```sql
+CREATE TABLE work_product_attribution (
+    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    message_id             UUID NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,  -- fk_work_product_attribution_message
+    user_id                UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,            -- fk_work_product_attribution_user
+    chat_id                UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,            -- fk_work_product_attribution_chat
+    project_id             UUID REFERENCES projects(id) ON DELETE SET NULL,                 -- fk_work_product_attribution_project
+    routed_inference_tier  INTEGER,
+    provider               TEXT,
+    model                  TEXT,
+    model_version          TEXT,
+    skill_ids              TEXT[] NOT NULL DEFAULT ARRAY[]::text[],
+    playbook_id            UUID,                                          -- plain UUID; no FK (playbooks land in M3)
+    content_hash           TEXT NOT NULL,
+    timestamp              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_work_product_tier_range
+        CHECK (routed_inference_tier IS NULL OR (routed_inference_tier BETWEEN 1 AND 5))
+);
+
+CREATE INDEX idx_work_product_user_timestamp
+    ON work_product_attribution (user_id, timestamp DESC);
+CREATE INDEX idx_work_product_chat
+    ON work_product_attribution (chat_id);
+```
+
+`playbook_id` is a plain UUID column with no FK constraint — migration
+0017 (M1) predates the `playbooks` table (migration 0031, M3), so the
+reference is stored unbound.
+
 ---
 
-## Skills
+## Skills (sketch — **not built**; superseded by `user_skills`)
 
-Skills are stored both on disk (the canonical source for built-in skills loaded at startup) and in the database (for user-scoped and team-scoped skills, plus any forks of built-ins).
+> **Status: NOT created by any migration.** The `skills`,
+> `skill_reference_files`, and `skill_example_files` tables below are an
+> early sketch from before [ADR 0004](adr/0004-skill-loader-locus.md)
+> made skills **filesystem-canonical**. There is no `skills` SQL table,
+> no `skill_reference_files` table, and no `skill_example_files` table in
+> the shipped schema (verified against migrations 0001–0047 and
+> `api/app/models/` — no `Skill` ORM model exists). Built-in skills load
+> from disk at startup; user/team-scoped skills are stored in the
+> **`user_skills`** table (migration 0013, documented below), and the
+> singleton Organization Profile is the **`organization_profile`** table
+> (migration 0010, documented below). The blocks here are retained only
+> as a record of the original sketch.
 
-### `skills`
+The original sketch stored skills both on disk (the canonical source for built-in skills loaded at startup) and in the database (for user-scoped and team-scoped skills, plus any forks of built-ins).
+
+### `skills` (sketch — not built)
 
 ```sql
 CREATE TABLE skills (
@@ -499,9 +604,9 @@ CREATE INDEX idx_skills_owner_active ON skills(owner_id, scope) WHERE deleted_at
 
 The `idx_skills_org_profile_singleton` partial unique index enforces that there is at most one Organization Profile in the deployment.
 
-### `skill_reference_files` and `skill_example_files`
+### `skill_reference_files` and `skill_example_files` (sketch — not built)
 
-Reference and example files associated with a skill. For built-in skills these are loaded from disk at startup; user/team skills store them here.
+Reference and example files associated with a skill. For built-in skills these are loaded from disk at startup; user/team skills store them here. **Like `skills` above, these tables were never created** — reference/example files for built-ins live on disk, and user-skill bodies are stored inline in `user_skills.body` / `user_skills.frontmatter_extra`.
 
 ```sql
 CREATE TABLE skill_reference_files (
@@ -521,6 +626,37 @@ CREATE TABLE skill_example_files (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (skill_id, path)
 );
+```
+
+### `organization_profile` (Task D4, migration 0010)
+
+The Organization Profile is a "singleton skill" per PRD §3.12 — same
+SKILL.md format and inspectability, treated as a singleton by the Skill
+Service. Because ADR 0004 keeps built-in skills filesystem-canonical
+(there is no `skills` SQL table to add an `is_organization_profile`
+column to), D4 backs the GET/PUT API with a focused single-row table.
+The gateway-side prompt-assembler fetches the row's content and prepends
+it to every attached skill whose frontmatter does not opt out
+(`use_organization_profile: false`).
+
+```sql
+CREATE TABLE organization_profile (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    content_md  TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by  UUID REFERENCES users(id) ON DELETE SET NULL  -- fk_org_profile_updated_by
+);
+
+-- Singleton enforcement — Postgres "at most one row" pattern: the
+-- expression index collapses every row to the same literal, so a second
+-- insert violates the unique index (23505).
+CREATE UNIQUE INDEX idx_organization_profile_singleton
+    ON organization_profile ((true));
+
+CREATE TRIGGER trg_organization_profile_updated_at
+    BEFORE UPDATE ON organization_profile
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ```
 
 ---
@@ -570,10 +706,19 @@ CREATE TABLE documents (
     structured_content  JSONB,            -- Docling's structured representation; M2 reads
     normalized_content  TEXT NOT NULL DEFAULT '',  -- M2-A1 (migration 0024); see below
     was_ocrd            BOOLEAN NOT NULL DEFAULT FALSE,  -- M2-A1 (migration 0024); see below
+    ingest_status       TEXT NOT NULL DEFAULT 'ok'    -- M3-0.3 (migration 0030); see below
+        CHECK (ingest_status IN ('ok','parse_failed','embed_failed','partial')),
+    ingest_failure_reason TEXT,                       -- M3-0.3 (migration 0030); populated when ingest_status <> 'ok'
     processed_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_documents_file_id ON documents(file_id);
+-- Partial index — only the failure-state rows. The 'ok' rows are
+-- the steady-state majority; including them would bloat the index
+-- and add write cost on the dominant insert path. Powers the
+-- /api/v1/admin/ingest-health aggregate without a sequential scan.
+CREATE INDEX idx_documents_ingest_status ON documents(ingest_status)
+    WHERE ingest_status IN ('parse_failed','embed_failed','partial');
 ```
 
 Per ADR 0006, the `parser` column carries the cascade outcome:
@@ -597,6 +742,19 @@ fallback for image-only PDFs, and the tolerant-match verification stage
 (M2-B1) uses this flag to enable OCR-artifact normalization. Every M1
 ingest and every backfilled row sets `was_ocrd = FALSE` because M1's
 parsers never OCR (image-only PDFs are rejected with `parse_failed`).
+
+Per M3-0.3 / DE-276 (migration 0030), `ingest_status` records the
+**post-parse** outcome that `files.ingestion_status` cannot detect: an
+embed batch failure that leaves chunks with NULL embeddings and
+silently degrades hybrid retrieval to FTS-only. `embed_failed` is set
+when zero chunks were embedded before the batch raised; `partial` is
+set when some succeeded but later batches did not — the operator can
+re-run ingest to recover from either state. `parse_failed` is a
+reserved value (no v0.3 code path writes it; parse failures stop
+before a `documents` row is created and are tracked at the file
+level instead). The `/api/v1/admin/ingest-health` endpoint aggregates
+this column alongside `files.ingestion_status` so operators see a
+single ingest-health summary across both pipelines.
 
 ### `document_chunks`
 
@@ -768,7 +926,7 @@ chunk.
 
 ---
 
-## Saved prompts (per [DE-013](docs/PRD.md#de-013--saved-prompts-library) / Issue 04)
+## Saved prompts (per [DE-013](PRD.md#de-013--saved-prompts-library) / Issue 04)
 
 ```sql
 CREATE TABLE saved_prompts (
@@ -966,65 +1124,771 @@ CREATE INDEX idx_inference_log_refused ON inference_routing_log(timestamp DESC) 
 
 ---
 
-## M3+ tables (sketched, land at the indicated milestone)
+### `tool_egress_log`
+
+Gateway-written (ADR 0014 D3); counts/types only, never raw payloads. One row per outbound tool/data-source call through the gateway. Distinct from `inference_routing_log` (different access pattern and retention) and from `audit_log` (hot path, per-call counts only).
+
+| Column                  | Type        | Nullable | Default              | Notes                                             |
+|-------------------------|-------------|----------|----------------------|---------------------------------------------------|
+| `id`                    | UUID        | NO       | `gen_random_uuid()`  | Primary key                                       |
+| `timestamp`             | TIMESTAMPTZ | NO       | `now()`              | When the call was made                            |
+| `request_id`            | TEXT        | YES      |                      | Correlates with gateway request span              |
+| `provider`              | TEXT        | NO       |                      | Tool provider name (e.g. `courtlistener`)         |
+| `tool`                  | TEXT        | NO       |                      | Tool/endpoint called (e.g. `search_opinions`)     |
+| `tier`                  | INTEGER     | NO       |                      | Egress tier: `0` = no provider resolved (pre-resolution refusal); `1`–`5` = egress tier; CHECK enforced |
+| `bytes_out`             | INTEGER     | YES      |                      | Bytes sent to provider                            |
+| `bytes_in`              | INTEGER     | YES      |                      | Bytes received from provider                      |
+| `anonymization_applied` | BOOLEAN     | NO       | `false`              | Whether PII anonymization ran before egress       |
+| `refused`               | BOOLEAN     | NO       | `false`              | Whether the call was refused by the gateway       |
+| `refusal_reason`        | TEXT        | YES      |                      | E.g. `tier_below_minimum`, `provider_unavailable` |
+
+```sql
+CREATE INDEX ix_tool_egress_log_provider  ON tool_egress_log(provider);
+CREATE INDEX ix_tool_egress_log_timestamp ON tool_egress_log(timestamp);
+```
+
+---
+
+### `research_cluster_metadata` + `research_opinion_metadata` (WS3b)
+
+Read-through metadata cache for CourtListener case law. One row per fetched cluster (case) and one row per fetched opinion. Opinion full-text BODIES live in object storage, referenced by `storage_path`; only metadata is stored in the DB. Introduced by migration `0049_research_metadata.py`.
+
+**`research_cluster_metadata`**
+
+| Column         | Type        | Nullable | Default   | Notes                                    |
+|----------------|-------------|----------|-----------|------------------------------------------|
+| `cluster_id`   | BIGINT      | NO       |           | Primary key; CourtListener cluster ID    |
+| `case_name`    | TEXT        | YES      |           | Case name (e.g. "Obergefell v. Hodges")  |
+| `court`        | TEXT        | YES      |           | Court slug (e.g. `scotus`)               |
+| `date_filed`   | TEXT        | YES      |           | ISO date string from CourtListener       |
+| `absolute_url` | TEXT        | YES      |           | Relative URL on CourtListener            |
+| `cached_at`    | TIMESTAMPTZ | NO       | `now()`   | When this row was fetched and cached     |
+
+**`research_opinion_metadata`**
+
+| Column            | Type        | Nullable | Default   | Notes                                                      |
+|-------------------|-------------|----------|-----------|------------------------------------------------------------|
+| `opinion_id`      | BIGINT      | NO       |           | Primary key; CourtListener opinion ID                      |
+| `cluster_id`      | BIGINT      | NO       |           | FK-by-convention to `research_cluster_metadata.cluster_id` |
+| `text_field_used` | TEXT        | YES      |           | Which CourtListener field supplied the text                |
+| `storage_path`    | TEXT        | NO       |           | Object-storage key for the opinion body (never in DB)      |
+| `char_length`     | INTEGER     | NO       |           | Character count of stored body; used for quota checks      |
+| `cached_at`       | TIMESTAMPTZ | NO       | `now()`   | When this row was fetched and cached                       |
+
+```sql
+CREATE INDEX ix_research_opinion_metadata_cluster_id ON research_opinion_metadata(cluster_id);
+```
+
+---
+
+## Playbooks (per [PRD §3.7](PRD.md#37-playbooks), M3-A1)
+
+Substrate for the Playbook engine landing in M3. A playbook codifies an
+organization's standard positions and fallback positions on common
+contract issues; the LangGraph executor (M3-A2) walks each position
+against a target contract and produces a per-position assessment with
+redline suggestions. Three tables, all introduced by migration
+`0031_playbooks.py`:
+
+* `playbooks` — header row per playbook (name, contract type, version,
+  author).
+* `playbook_positions` — one row per issue inside a playbook. The
+  per-position list of acceptable alternatives lives in a JSONB
+  `fallback_tiers` column rather than a third normalized table (small
+  per-position lists; always fetched together with the position).
+* `playbook_executions` — one row per run of a playbook against a
+  target document. `results` is JSONB shaped per the M3-A2 executor.
 
 ### `playbooks` (M3)
 
 ```sql
 CREATE TABLE playbooks (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name            TEXT NOT NULL,
-    version         TEXT NOT NULL,
-    scope           TEXT NOT NULL CHECK (scope IN ('builtin','user','team')),
-    owner_id        UUID REFERENCES users(id) ON DELETE CASCADE,
-    title           TEXT NOT NULL,
-    description     TEXT,
-    content_yaml    TEXT NOT NULL,
+    contract_type   TEXT NOT NULL,         -- e.g. 'NDA' | 'MSA-SaaS' | 'DPA' | 'MSA-Commercial'
+    description     TEXT NOT NULL DEFAULT '',
+    version         TEXT NOT NULL DEFAULT '1.0.0',
+    created_by      UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at      TIMESTAMPTZ,
-    UNIQUE (name, version, scope, owner_id)
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-### `playbook_runs` (M3)
+`created_by` is nullable + `ON DELETE SET NULL` so a deleted operator's
+playbook stays available to the rest of the team — playbooks outlive
+their individual authors (matches the project / skill ownership model).
+
+`contract_type` is free-form per [PRD §3.7](PRD.md#37-playbooks);
+the canonical values used by the M3-A3 / M3-A5 built-ins are `'NDA'`,
+`'NDA-unilateral'`, `'MSA-SaaS'`, `'MSA-Commercial'`, `'DPA'`, but
+operators may define their own without a migration.
+
+### `playbook_positions` (M3)
 
 ```sql
-CREATE TABLE playbook_runs (
-    id                UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
-    playbook_id       UUID NOT NULL REFERENCES playbooks(id) ON DELETE RESTRICT,
-    chat_id           UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-    started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at      TIMESTAMPTZ,
-    status            TEXT NOT NULL CHECK (status IN ('running','completed','failed','cancelled')),
-    output_summary    TEXT,
-    findings_count    INTEGER,
-    error             TEXT
+CREATE TABLE playbook_positions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    playbook_id         UUID NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+    issue               TEXT NOT NULL,                                  -- e.g. 'Limitation of Liability'
+    description         TEXT NOT NULL DEFAULT '',
+    standard_language   TEXT NOT NULL,                                  -- the org's preferred clause
+    fallback_tiers      JSONB NOT NULL DEFAULT '[]'::jsonb,             -- ranked acceptable alternatives
+    redline_strategy    TEXT NOT NULL DEFAULT '',
+    severity_if_missing TEXT NOT NULL
+        CHECK (severity_if_missing IN ('critical','high','medium','low')),
+    detection_keywords  TEXT[] NOT NULL DEFAULT '{}'::text[],           -- lexical match
+    detection_examples  TEXT[] NOT NULL DEFAULT '{}'::text[],           -- embedding match
+    position_order      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_playbook_positions_playbook_order
+    ON playbook_positions(playbook_id, position_order);
+```
+
+The `fallback_tiers` JSONB array carries objects matching the Pydantic
+`FallbackTier` shape (`{rank, description, language}`). Storing as
+JSONB rather than a normalized table avoids a join on every executor
+read — the per-position list is small (typically 2-3 alternatives) and
+always loaded with the position.
+
+`detection_keywords` and `detection_examples` feed the M3-A2 executor's
+retrieval step: keywords drive a lexical match against the target
+contract; examples drive an embedding-based match.
+
+### `playbook_executions` (M3)
+
+```sql
+CREATE TABLE playbook_executions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    playbook_id         UUID NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+    target_document_id  UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    user_id             UUID REFERENCES users(id) ON DELETE SET NULL,
+    project_id          UUID REFERENCES projects(id) ON DELETE SET NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','running','completed','error')),
+    results             JSONB,                                          -- M3-A2 executor's payload
+    error               TEXT,                                           -- populated when status='error'
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at        TIMESTAMPTZ
+);
+
+-- "My recent executions" view for the UI (M3-A4).
+CREATE INDEX idx_playbook_executions_user_created
+    ON playbook_executions(user_id, created_at DESC);
+
+-- "What playbooks have been run against this document?" — drives the
+-- document-detail view's playbook-history surface (M3-A4).
+CREATE INDEX idx_playbook_executions_target_document
+    ON playbook_executions(target_document_id);
+```
+
+Status lifecycle: `pending → running → completed | error`. The CHECK
+constraint pins the enum at the storage layer.
+
+`user_id` and `project_id` are both `ON DELETE SET NULL` so historical
+executions survive operator or project deletion — audit trails stay
+intact even after the actor or matter is removed. The
+`target_document_id` FK is `ON DELETE CASCADE` because an execution
+against a deleted document has no anchor (the source the executor
+ran against is gone).
+
+### `easy_playbook_generations` (M3-A6, migration 0035)
+
+Backs the async Easy Playbook generation pipeline. `POST /api/v1/playbooks/easy`
+returns 202 with a generation-row id; the ARQ worker on the `arq:m3a6`
+queue runs the extract → cluster → assemble pipeline against the supplied
+documents and writes progress back to this row. The Phase-6 wizard's
+Step-3 inline editor consumes `draft_playbook` once `status='completed'`.
+
+```sql
+CREATE TABLE easy_playbook_generations (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id        UUID REFERENCES users(id) ON DELETE SET NULL,        -- fk_easy_playbook_generations_user_id
+    contract_type  TEXT NOT NULL,                                       -- free-form per PRD §3.7 ('NDA', 'MSA-SaaS', ...)
+    status         TEXT NOT NULL DEFAULT 'pending',
+    document_ids   UUID[] NOT NULL DEFAULT '{}'::uuid[],                -- source corpus snapshot; NOT an FK (docs may be soft-deleted)
+    draft_playbook JSONB,                                               -- assembled PlaybookCreate shape; populated on status='completed'
+    error_message  TEXT,                                                -- populated on status='error'
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at     TIMESTAMPTZ,                                         -- set on pending → running
+    completed_at   TIMESTAMPTZ,                                         -- set on either terminal state
+    CONSTRAINT chk_easy_playbook_generations_status
+        CHECK (status IN ('pending','running','completed','error'))
+);
+
+-- The wizard's history view sorts the caller's recent generations by recency.
+CREATE INDEX idx_easy_playbook_generations_user_recent
+    ON easy_playbook_generations (user_id, created_at DESC);
+```
+
+`user_id` is `ON DELETE SET NULL` so historical generations survive
+operator deletion (matches `playbook_executions`). `document_ids` is a
+snapshot array, deliberately not an FK, so the audit row is preserved
+even after a source document is soft-deleted.
+
+---
+
+## Tabular review (per [PRD §3.14](PRD.md#314-tabular--multi-document-review-m3), M3-C2)
+
+Substrate for the Tabular / Multi-Document Review surface
+([docs/tabular-review.md](tabular-review.md)) landing in M3. Each
+execution walks a `documents × columns` grid and produces a
+row-per-document by column-per-spec result, run as a LangGraph workflow
+on the existing `arq:m3a6` queue (Decision C-3 from the Phase C prep
+doc: reuse the queue rather than add a second worker container). One
+table, introduced by migration `0036_tabular_executions.py`:
+
+* `tabular_executions` — one row per execution; persists the inputs +
+  status + assembled grid so the result view can re-render a week later.
+
+### `tabular_executions` (M3)
+
+```sql
+CREATE TABLE tabular_executions (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id              UUID REFERENCES users(id) ON DELETE SET NULL,
+    parent_execution_id  UUID REFERENCES tabular_executions(id) ON DELETE SET NULL,
+    skill_name           TEXT,                                          -- filesystem-canonical skill name; NULL for ad-hoc column lists
+    status               TEXT NOT NULL DEFAULT 'pending',
+    document_ids         UUID[] NOT NULL DEFAULT '{}'::uuid[],          -- snapshot of source documents; NOT an FK
+    columns              JSONB NOT NULL DEFAULT '[]'::jsonb,            -- resolved column spec snapshotted at execution start
+    results              JSONB,                                         -- assembled grid; populated when status='completed'
+    cost_estimate_usd    NUMERIC(10,4),                                 -- operator-confirmed estimate at start
+    cost_actual_usd      NUMERIC(10,4),                                 -- backfilled incrementally as cells complete
+    error_text           TEXT,                                          -- populated when status='failed'
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at           TIMESTAMPTZ,
+    completed_at         TIMESTAMPTZ,
+    deleted_at           TIMESTAMPTZ,                                   -- soft-delete
+
+    CONSTRAINT chk_tabular_executions_status
+        CHECK (status IN ('pending','running','completed','failed','cancelled')),
+    CONSTRAINT fk_tabular_executions_user_id
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    CONSTRAINT fk_tabular_executions_parent_execution_id
+        FOREIGN KEY (parent_execution_id) REFERENCES tabular_executions(id) ON DELETE SET NULL
+);
+
+-- The list endpoint sorts the caller's non-deleted executions by recency.
+CREATE INDEX idx_tabular_executions_user_recent
+    ON tabular_executions (user_id, created_at DESC)
+    WHERE deleted_at IS NULL;
+
+-- Bulk-op siblings query their parent.
+CREATE INDEX idx_tabular_executions_parent
+    ON tabular_executions (parent_execution_id)
+    WHERE parent_execution_id IS NOT NULL;
+```
+
+Status lifecycle: `pending → running → completed | failed | cancelled`.
+The CHECK constraint pins the enum at the storage layer so an
+application bug can't insert an invalid value. `cancelled` is reached
+via `POST /tabular/executions/{id}/cancel` before the worker finishes;
+all three terminal states set `completed_at`.
+
+`user_id` is `ON DELETE SET NULL` so historical executions survive
+operator deletion (matches `playbook_executions` and
+`easy_playbook_generations`).
+
+`parent_execution_id` is a nullable self-FK (`ON DELETE SET NULL`),
+non-NULL only on bulk-op sibling rows. Per Decision C-9, a bulk
+operation (e.g., "Redline column N") spawns a child `tabular_executions`
+row pointing at the original rather than mutating the original grid —
+preserving the original's auditability. Deleting a parent does not
+cascade-delete its siblings.
+
+`document_ids` is the snapshot of source document UUIDs from the
+caller's selection. It is deliberately **not** a foreign key: documents
+can be soft-deleted after the execution completes, and the audit row is
+preserved regardless (matches the `easy_playbook_generations` pattern).
+Document display names are carried inside the `results` grid rows, not
+in a dedicated column.
+
+`columns` is the resolved column spec snapshotted at execution start —
+either the skill's `lq_ai.columns` block at that moment, or the
+operator's ad-hoc list typed in the wizard's column step. Snapshotting
+is the load-bearing invariant: re-rendering the grid later must be
+honest about what was actually run, not what the skill currently says.
+
+`results` is the assembled grid shape
+`{rows: [{document_id, document_name, cells: {column_name: CellResult}}]}`,
+populated once status is `completed` (may carry partial output on
+`failed`).
+
+Soft delete via `deleted_at` matches the `playbooks.deleted_at` posture
+from M3-A6's migration 0034.
+
+---
+
+## Intake bridges (per [PRD §3.15](PRD.md#315-intake-bridges-m3), M3-D)
+
+Substrate for the Slack and Microsoft Teams intake bridges
+([docs/intake-bridges.md](intake-bridges.md)) landing in M3-D. Each
+bridge runs its own OAuth install flow in a dedicated service
+(`slack-bridge`, `teams-bridge`) and POSTs the resulting install tuple
+to the backend, which persists one row per connected workspace/tenant.
+Two tables, introduced by migrations `0037_slack_workspaces.py` and
+`0038_teams_tenants.py`. Both use a natural-key unique constraint and
+soft-delete; the persistence endpoints **upsert on the natural key**,
+reviving a soft-deleted row (setting `deleted_at` back to NULL) on
+re-install.
+
+### `slack_workspaces` (M3-D1)
+
+```sql
+CREATE TABLE slack_workspaces (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    team_id                  TEXT NOT NULL,                            -- Slack workspace id (T0123456...); natural key
+    team_name                TEXT NOT NULL,                           -- snapshotted at install; not auto-refreshed
+    bot_token_encrypted      BYTEA NOT NULL,                          -- Fernet-wrapped xoxb-... bot token
+    bot_user_id              TEXT NOT NULL,                           -- Slack user id of the install's bot user (U0123456...)
+    installer_slack_user_id  TEXT NOT NULL,                           -- operator who clicked install; audit-only
+    scope                    TEXT NOT NULL,                           -- comma-separated OAuth scope list, verbatim
+    installed_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at               TIMESTAMPTZ,                             -- soft-delete; upsert revives to NULL
+
+    CONSTRAINT uq_slack_workspaces_team_id UNIQUE (team_id)
 );
 ```
 
-### `autonomous_tasks` (M4)
+`bot_token_encrypted` is `BYTEA` holding the Fernet ciphertext of the
+bot user OAuth token (`xoxb-...`). It is encrypted at rest under
+`LQ_AI_BRIDGE_MASTER_KEY` — deliberately **separate** from the
+gateway's provider-key master key (Decision M3-D1-1: Slack bot tokens
+enable bot impersonation, provider keys enable inference routing —
+different blast radii, different keys). Decrypted in-memory only when
+the bridge needs to post a reply.
+
+`team_id` is the natural key from Slack's side and carries the only
+unique constraint; the upsert path conflicts on it. Per Decision
+M3-D1-2, Slack rotates the bot token on re-install, so the upsert
+replaces `bot_token_encrypted` + `installer_slack_user_id` + `scope`
+and revives `deleted_at`. No separate index on `team_id` — the unique
+constraint's backing index covers it.
+
+`installer_slack_user_id` is audit-only and grants no LQ.AI
+permissions; `scope` is stored verbatim so an operator can audit what
+the workspace consented to.
+
+### `teams_tenants` (M3-D3)
 
 ```sql
-CREATE TABLE autonomous_tasks (
-    id                UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
-    user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    name              TEXT NOT NULL,
-    schedule          TEXT,                    -- cron expression
-    trigger_type      TEXT NOT NULL CHECK (trigger_type IN ('cron','watch_kb','watch_email','watch_calendar')),
-    trigger_config    JSONB NOT NULL,
-    skill_chain       TEXT[] NOT NULL,         -- ordered list of skills
-    enabled           BOOLEAN NOT NULL DEFAULT TRUE,
-    last_run_at       TIMESTAMPTZ,
-    next_run_at       TIMESTAMPTZ,
+CREATE TABLE teams_tenants (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      TEXT NOT NULL,                                    -- Microsoft tenant (M365 directory) GUID; natural key
+    tenant_name    TEXT NOT NULL,                                   -- displayName at install; not auto-refreshed
+    installer_oid  TEXT NOT NULL,                                   -- M365 oid claim of the admin who consented; audit-only
+    installed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at     TIMESTAMPTZ,                                     -- soft-delete; upsert revives to NULL
+
+    CONSTRAINT uq_teams_tenants_tenant_id UNIQUE (tenant_id)
+);
+```
+
+There is **no encrypted-token column**, and this is deliberate. Unlike
+Slack (which issues per-workspace bot tokens), Microsoft Teams uses
+**app-level bot credentials** — the bot authenticates to the Bot
+Framework with the operator's single `MICROSOFT_APP_ID` +
+`MICROSOFT_APP_PASSWORD` regardless of which tenant it runs in. So
+there is no per-tenant secret to persist; this table only carries the
+identity-binding fields the admin UI (M3-D4) needs to surface "the bot
+is installed in tenant X". (Per-user refresh-token storage for an M4
+on-behalf-of flow is a future column, not present today.)
+
+`tenant_id` is the natural key from Microsoft's side and carries the
+only unique constraint. Per Decision M3-D3-2 the persistence endpoint
+upserts on it: a re-install in the same M365 tenant replaces
+`tenant_name` + `installer_oid` and revives `deleted_at`. The bridge
+runs as a multi-tenant Microsoft identity-platform app (Decision
+M3-D3-4), so this table can hold rows for many tenants concurrently.
+
+`installer_oid` is audit-only and grants no LQ.AI permissions.
+
+## Autonomous layer (per [PRD §3.10](PRD.md#310-autonomous-layer-m4), M4)
+
+The per-user Autonomous agent's data substrate (migration
+`0039_autonomous_layer.py`, M4-A1; see
+[ADR-0013](adr/0013-autonomous-layer-design-influences.md)). Five
+tables: the brake-bearing run record (`autonomous_sessions`) plus four
+primitive tables for triggers (`autonomous_schedules`,
+`autonomous_watches`), curated memory (`autonomous_memory`), and
+observed precedent (`precedent_entries`).
+
+**Hard per-user isolation.** Every table carries a non-null `user_id`
+FK with `ON DELETE CASCADE`. Unlike the playbook tables (which
+`SET NULL` to preserve shared audit history), autonomous state is
+private to the operator who ran it and carries no shared work product,
+so a user's deletion removes all of their autonomous state.
+
+### `autonomous_sessions` (M4)
+
+The run record carrying the brakes — cost cap, halt state, idle-halt
+window, and the phase machine the executor (later M4 tasks) walks.
+`halt_state` is orthogonal to `status`: `status` is the terminal-or-
+running lifecycle, `halt_state` is the brake the executor checks at
+every step.
+
+```sql
+CREATE TABLE autonomous_sessions (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,        -- fk_autonomous_sessions_user_id
+    project_id        UUID REFERENCES projects(id) ON DELETE SET NULL,             -- fk_autonomous_sessions_project_id
+    trigger_kind      TEXT NOT NULL CHECK (trigger_kind IN ('watch','schedule','suggestion','manual')),
+    trigger_ref       UUID,                                                        -- id of the schedule/watch/suggestion that started it
+    current_phase     TEXT NOT NULL DEFAULT 'intake'
+                          CHECK (current_phase IN ('intake','analysis','drafting','ethics_review','delivery')),
+    halt_state        TEXT NOT NULL DEFAULT 'running'
+                          CHECK (halt_state IN ('running','halt_requested','halted','paused')),
+    max_cost_usd      NUMERIC(10,4),                                               -- per-session cost cap; NULL = no cap
+    cost_total_usd    NUMERIC(10,4) NOT NULL DEFAULT 0,                            -- accumulates as the executor spends
+    cost_cap_reached  BOOLEAN NOT NULL DEFAULT FALSE,                              -- latches TRUE when the cap is hit
+    idle_halt_minutes INT NOT NULL DEFAULT 5,                                      -- self-halt after this much inactivity
+    last_activity_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status            TEXT NOT NULL DEFAULT 'running'
+                          CHECK (status IN ('running','completed','halted','failed')),
+    result            JSONB,
+    error             TEXT,
+    -- M4-B3 (migration 0042): trigger→target seam. Every trigger source
+    -- populates the non-null subset of {kb_id, playbook_id, skill_ref,
+    -- query}; the executor reads it into initial_state — uniform across
+    -- all trigger kinds, decoupled from the schedule/watch tables.
+    params            JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at      TIMESTAMPTZ
 );
 
-CREATE INDEX idx_autonomous_tasks_next_run ON autonomous_tasks(next_run_at) WHERE enabled = TRUE AND next_run_at IS NOT NULL;
+-- "My recent sessions" view for the UI.
+CREATE INDEX idx_autonomous_sessions_user_created ON autonomous_sessions(user_id, created_at DESC);
+-- The scheduler's "which running sessions need a halt/idle check?" scan (partial).
+CREATE INDEX idx_autonomous_sessions_active ON autonomous_sessions(halt_state, last_activity_at) WHERE status = 'running';
 ```
 
-### `contract_relationships` (M4 — Contract Repository auto-relationship detection)
+### `autonomous_schedules` (M4)
+
+A cron-triggered run definition. `cron_expr` is a standard five-field
+cron string. `playbook_id` / `skill_ref` / `target_kb_id` describe what
+the triggered session runs. Soft-deleted via `deleted_at`.
+
+```sql
+CREATE TABLE autonomous_schedules (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,           -- fk_autonomous_schedules_user_id
+    project_id    UUID REFERENCES projects(id) ON DELETE SET NULL,                -- fk_autonomous_schedules_project_id
+    name          TEXT,
+    cron_expr     TEXT NOT NULL,
+    playbook_id   UUID REFERENCES playbooks(id) ON DELETE SET NULL,               -- fk_autonomous_schedules_playbook_id
+    skill_ref     TEXT,
+    target_kb_id  UUID REFERENCES knowledge_bases(id) ON DELETE SET NULL,         -- fk_autonomous_schedules_target_kb_id
+    enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Donna #8 (migration 0047): opt-in document-grade artifact emission
+    -- for the schedule's sessions; default off — existing automations
+    -- see zero behavior/cost change.
+    emit_artifacts BOOLEAN NOT NULL DEFAULT FALSE,
+    last_run_at   TIMESTAMPTZ,
+    next_run_at   TIMESTAMPTZ,
+    -- M4 real-executor work (migration 0045): per-schedule cost cap.
+    -- NULL = fall back to settings.autonomous_default_max_cost_usd at spawn.
+    max_cost_usd  NUMERIC(10,4),
+    deleted_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- M4-B3 (migration 0042): the dispatcher scan
+--   WHERE enabled AND deleted_at IS NULL AND next_run_at <= now()
+-- The partial predicate matches the always-true filter so the planner
+-- reads only live, enabled schedules ordered by next_run_at.
+CREATE INDEX idx_autonomous_schedules_due
+    ON autonomous_schedules (next_run_at)
+    WHERE enabled AND deleted_at IS NULL;
+```
+
+### `autonomous_watches` (M4)
+
+A KB-change-triggered run definition. When the watched
+`knowledge_base_id` changes (a new file ingested), the agent starts a
+session running `playbook_id` / `skill_ref` against the change.
+Soft-deleted via `deleted_at`.
+
+```sql
+CREATE TABLE autonomous_watches (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,      -- fk_autonomous_watches_user_id
+    project_id         UUID REFERENCES projects(id) ON DELETE SET NULL,           -- fk_autonomous_watches_project_id
+    knowledge_base_id  UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,  -- fk_autonomous_watches_knowledge_base_id
+    playbook_id        UUID REFERENCES playbooks(id) ON DELETE SET NULL,          -- fk_autonomous_watches_playbook_id
+    skill_ref          TEXT,
+    enabled            BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Donna #8 (migration 0047): opt-in document-grade artifact emission
+    -- for the watch's sessions; default off — existing automations see
+    -- zero behavior/cost change.
+    emit_artifacts     BOOLEAN NOT NULL DEFAULT FALSE,
+    -- M4 real-executor work (migration 0045): per-watch cost cap.
+    -- NULL = fall back to settings.autonomous_default_max_cost_usd at spawn.
+    max_cost_usd       NUMERIC(10,4),
+    deleted_at         TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The watch dispatcher's "which watches fire for this KB?" lookup; only live, enabled watches matter (partial).
+CREATE INDEX idx_autonomous_watches_kb_enabled ON autonomous_watches(knowledge_base_id) WHERE enabled AND deleted_at IS NULL;
+```
+
+### `autonomous_memory` (M4)
+
+Memory notes the agent proposes for user curation. `state` walks
+`proposed → kept | dismissed`. `category` is a free-form bucket (e.g.
+`drafting_preference`). `source_session_id` links back to the proposing
+session (`SET NULL` if that session is later deleted). Soft-deleted via
+`deleted_at`.
+
+```sql
+CREATE TABLE autonomous_memory (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,      -- fk_autonomous_memory_user_id
+    state              TEXT NOT NULL CHECK (state IN ('proposed','kept','dismissed')),
+    category           TEXT NOT NULL,
+    content            TEXT NOT NULL,
+    source_session_id  UUID REFERENCES autonomous_sessions(id) ON DELETE SET NULL,  -- fk_autonomous_memory_source_session_id
+    kept_at            TIMESTAMPTZ,
+    deleted_at         TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The "show me my memory notes in state X" curation view.
+CREATE INDEX idx_autonomous_memory_user_state ON autonomous_memory(user_id, state);
+```
+
+### `precedent_entries` (M4)
+
+Observed precedent patterns across a user's sessions. `pattern_kind` is
+a free-form classifier; `observed_count` increments each time the
+pattern recurs. `source_session_id` links to the first observing
+session (`SET NULL` on delete). `dismissed_at` is set when the user
+dismisses the precedent.
+
+```sql
+CREATE TABLE precedent_entries (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,      -- fk_precedent_entries_user_id
+    pattern_kind       TEXT NOT NULL,
+    summary            TEXT NOT NULL,
+    observed_count     INT NOT NULL DEFAULT 1,
+    source_session_id  UUID REFERENCES autonomous_sessions(id) ON DELETE SET NULL,  -- fk_precedent_entries_source_session_id
+    dismissed_at       TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The "my live precedents for pattern kind X" lookup; dismissed precedents drop out (partial).
+CREATE INDEX idx_precedent_entries_user_kind ON precedent_entries(user_id, pattern_kind) WHERE dismissed_at IS NULL;
+
+-- M4-B2 (migration 0041): backs the race-safe propose_precedent upsert
+-- (INSERT ... ON CONFLICT). The recurrence key is (user_id, pattern_kind,
+-- summary), but `summary` is unbounded TEXT and a btree tuple has a
+-- ~2704-byte limit; hashing with md5() yields a fixed 32-char digest. The
+-- partial WHERE preserves "a dismissed precedent is not reused": a new
+-- observation after dismissal does not conflict and inserts a fresh row.
+CREATE UNIQUE INDEX uq_precedent_entries_user_kind_summary_active
+    ON precedent_entries (user_id, pattern_kind, md5(summary))
+    WHERE dismissed_at IS NULL;
+```
+
+> **Note (UUID default):** these tables use `gen_random_uuid()` (UUIDv4)
+> rather than the doc-aspirational `uuid_generate_v7()`, matching what
+> the migrations actually ship (see the Conventions note and the
+> `audit_log` / `inference_routing_log` precedent above).
+
+### `autonomous_notifications` (M4-A3.2)
+
+In-app notification substrate written by the `notify` chokepoint handler
+(A3.3). Pulled forward from M4-C1 so A3.3 has a durable write target.
+M4-C1 adds email/SMTP transport, the read/dismiss API, the web surface,
+and webhook dispatch.
+
+**Hard per-user isolation.** Both `user_id` and `session_id` carry `ON
+DELETE CASCADE` — notifications cascade with their parent session and
+their owner user.
+
+**Channel enum.** `channel` allows `('in_app','email','webhook')`. The
+`webhook` value is **RESERVED** (not dispatched until DE-312, Decision
+M4-8); its presence means M4-C1's fold-in is purely additive.
+
+**Body contract.** `body` carries counts/types/IDs + a link to the
+receipt — **never raw entity values**. `payload` is optional structured
+JSONB the web renders (same constraint).
+
+**Read index (added in migration 0043, M4-C1).** Migration 0040 deferred
+the read index until the read-API query shape was concrete; 0043 adds it
+now that the shape is known —
+`GET /api/v1/autonomous/notifications WHERE user_id = :u [AND read_at IS NULL] ORDER BY created_at DESC`.
+The index is a **partial** `(user_id, created_at DESC) WHERE read_at IS NULL`,
+serving the hot `?unread=true` query (the predicate matches `read_at IS NULL`
+exactly; the `created_at DESC` trailing column matches the newest-first sort).
+The all-notifications list is low-volume per user and rides the `user_id`
+prefix.
+
+```sql
+CREATE TABLE autonomous_notifications (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,               -- fk_autonomous_notifications_user_id
+    session_id  UUID NOT NULL REFERENCES autonomous_sessions(id) ON DELETE CASCADE, -- fk_autonomous_notifications_session_id
+    channel     TEXT NOT NULL DEFAULT 'in_app'
+                    CHECK (channel IN ('in_app','email','webhook')),                 -- chk_autonomous_notifications_channel
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,  -- counts/types/IDs + receipt link; NO raw entity values
+    payload     JSONB,          -- optional structured counts/IDs for the web (no raw values)
+    read_at     TIMESTAMPTZ,    -- NULL = unread; set by M4-C1 read/dismiss API
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Migration 0043 (M4-C1): partial read index serving
+--   GET /autonomous/notifications?unread=true
+--   WHERE user_id = :u AND read_at IS NULL ORDER BY created_at DESC
+CREATE INDEX idx_autonomous_notifications_user_unread
+    ON autonomous_notifications (user_id, created_at DESC)
+    WHERE read_at IS NULL;
+```
+
+### `project_context_proposals` (M4-B2, migration 0041)
+
+Records the autonomous agent's *proposals* to promote a recurring
+precedent into a Project's context document. The agent NEVER writes
+`projects.context_md` directly (ADR 0013 D5): it writes a proposal here,
+and the user accepting it
+(`POST /autonomous/project-context-proposals/{id}/accept`) is the
+authorized write that appends `suggested_md` to the Project's context.
+
+**Hard per-user isolation.** All three FKs (`user_id`, `precedent_id`,
+`project_id`) are `ON DELETE CASCADE` — a proposal is meaningless without
+its precedent or target project, and autonomous state is private to its
+owner.
+
+```sql
+CREATE TABLE project_context_proposals (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,                 -- fk_project_context_proposals_user_id
+    precedent_id  UUID NOT NULL REFERENCES precedent_entries(id) ON DELETE CASCADE,      -- fk_project_context_proposals_precedent_id
+    project_id    UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,               -- fk_project_context_proposals_project_id
+    suggested_md  TEXT NOT NULL,                                                         -- server-derived from the precedent's summary at promote time
+    state         TEXT NOT NULL DEFAULT 'proposed',
+    accepted_at   TIMESTAMPTZ,
+    rejected_at   TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_project_context_proposals_state
+        CHECK (state IN ('proposed','accepted','rejected'))
+);
+
+-- (user_id, state) backs the per-user, state-filtered list query that
+-- GET /autonomous/project-context-proposals issues.
+CREATE INDEX idx_project_context_proposals_user_state
+    ON project_context_proposals (user_id, state);
+```
+
+### `autonomous_findings` (migration 0046)
+
+Persists one row per finding a run emits via the `emit_finding`
+chokepoint, so the run's work-product can be read back after the run
+(`GET /autonomous/sessions/{id}/findings`, stable `created_at, id`
+order — rows from one run share a transaction-stable `now()`). Before
+0046, findings were echoed into transient LangGraph state and only a
+count survived.
+
+**No `user_id` column.** Authz is via the owning session: the read
+endpoint loads the owned session first (404 id-probing-safe), then
+queries by `session_id`. The `session_id` FK is `ON DELETE CASCADE` — a
+finding belongs to one session and is meaningless without it.
+
+**No CHECK on `severity`.** Unlike the other autonomous enum columns,
+`severity` is LLM-emitted free text (`info` | `warn` | `critical` are
+the intended values, but a stray `high` etc. must store, not reject the
+finding row).
+
+```sql
+CREATE TABLE autonomous_findings (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id  UUID NOT NULL REFERENCES autonomous_sessions(id) ON DELETE CASCADE,  -- fk_autonomous_findings_session_id
+    severity    TEXT NOT NULL,  -- LLM-emitted free text; deliberately NO CHECK
+    title       TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The read endpoint's by-session query.
+CREATE INDEX ix_autonomous_findings_session_id ON autonomous_findings(session_id);
+```
+
+### `autonomous_artifacts` (migration 0047, Donna #8)
+
+References to document-grade artifacts (markdown memos) an **opted-in**
+run persisted into its target knowledge base via the `emit_artifact`
+chokepoint. This table is the *reference*, not the document — the
+document itself lives in `files` / the KB like any other upload (the
+handler writes File + Document + chunks + KB attach directly). Read
+back via `GET /autonomous/sessions/{id}/artifacts` (stable
+`created_at, id` order — rows from one run share a transaction-stable
+`now()`);
+`document_id` is enriched at read time via the unique
+`documents.file_id` — it is not a column here.
+
+**Deletion semantics.** `session_id` FK is `ON DELETE CASCADE` — the
+artifact *reference* dies with its session. `file_id` FK is `ON DELETE
+SET NULL` — the KB document **outlives** the session (it is the user's
+deliverable); a hard file-delete nulls the ref while the name/size
+metadata survives here.
+
+**No `user_id` column.** Authz is via the owning session, exactly like
+`autonomous_findings` (the read endpoint owner-gates by loading the
+owned session, then queries by `session_id`).
+
+**No CHECK on `name`/`mime`.** Both are LLM-emitted free text (the
+`autonomous_findings.severity` precedent) — whatever the model produces
+must store.
+
+Migration 0047 also adds the opt-in `emit_artifacts` flag (BOOLEAN NOT
+NULL DEFAULT FALSE) to `autonomous_schedules` and `autonomous_watches`
+(documented in their blocks above).
+
+```sql
+CREATE TABLE autonomous_artifacts (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id  UUID NOT NULL REFERENCES autonomous_sessions(id) ON DELETE CASCADE,  -- fk_autonomous_artifacts_session_id
+    file_id     UUID REFERENCES files(id) ON DELETE SET NULL,                        -- fk_autonomous_artifacts_file_id
+    name        TEXT NOT NULL,    -- LLM-emitted free text; deliberately NO CHECK
+    mime        TEXT NOT NULL,    -- LLM-emitted free text; deliberately NO CHECK
+    size_bytes  BIGINT NOT NULL,  -- of the encoded bytes object storage holds
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The read endpoint's by-session query.
+CREATE INDEX ix_autonomous_artifacts_session_id ON autonomous_artifacts(session_id);
+```
+
+## M4+ tables (sketched, land at the indicated milestone)
+
+### `autonomous_tasks` (M4 — **superseded**)
+
+> **Superseded by `autonomous_sessions` + the four primitive tables
+> above.** `autonomous_tasks` was a single-table sketch that conflated
+> the run record with its triggers. Per [ADR-0013](adr/0013-autonomous-layer-design-influences.md)
+> the M4 design (landed in migration `0039`, M4-A1) split it into the
+> brake-bearing `autonomous_sessions` run record plus
+> `autonomous_schedules` / `autonomous_watches` (triggers),
+> `autonomous_memory`, and `precedent_entries`. This block is retained
+> only as a record of the original sketch; it is not created by any
+> migration.
+
+### `contract_relationships` (M4 — Contract Repository auto-relationship detection; **not built**)
+
+> **Status: NOT created by any migration.** The Contract Repository
+> auto-relationship graph is an M4-roadmap capability that was **not**
+> built (see [HONEST-STATE.md](HONEST-STATE.md) §M4). The block below is
+> the original sketch, retained as a forward-looking record only.
 
 ```sql
 CREATE TABLE contract_relationships (
@@ -1088,13 +1952,36 @@ CREATE INDEX idx_relationships_target ON contract_relationships(target_file_id);
 
 ## Migration approach
 
-- **Alembic** for schema migrations.
-- Initial migration `0001_initial.py` creates all M1 tables.
-- `0002_skills.py` creates skills + reference + example tables.
-- `0003_audit_log.py` creates audit_log + inference_routing_log.
-- M2 migrations add citation-engine fields.
-- M3 migrations add playbooks, playbook_runs.
-- M4 migrations add autonomous_tasks, contract_relationships.
+- **Alembic** for schema migrations. **Migration head is `0047`.** The
+  `0001`–`0047` sequence in `api/alembic/versions/` is the schema truth;
+  this document is reconciled to it.
+- `0001_initial.py` creates the core M1 tables (`users`, `user_sessions`,
+  `audit_log`, `inference_routing_log`, and the M1 foundation). Note:
+  there is **no** `skills` SQL table — built-in skills are
+  filesystem-canonical per ADR 0004; user/team skills land in
+  `user_skills` (`0013`).
+- M1 continues: files (`0003`), projects + documents/chunks (`0004`/`0005`),
+  chats + messages (`0006`), knowledge bases (`0007`), user_export_jobs
+  (`0009`), organization_profile (`0010`), saved_prompts (`0011`),
+  user_skills (`0013`), teams + team_members (`0014`),
+  enhance_prompt_interactions (`0015`), work_product_attribution (`0017`),
+  project_knowledge_bases (`0021`).
+- M2 (`0024`–`0029`) adds citation-engine fields and `message_citations`.
+- M3 adds playbooks + positions + executions (`0031`),
+  easy_playbook_generations (`0035`), tabular_executions (`0036`), and the
+  intake-bridge tables slack_workspaces (`0037`) + teams_tenants (`0038`).
+- M4 adds the autonomous layer: `0039` (autonomous_sessions,
+  autonomous_schedules, autonomous_watches, autonomous_memory,
+  precedent_entries — superseding the sketched `autonomous_tasks`),
+  `0040` (autonomous_notifications), `0041` (project_context_proposals +
+  precedent upsert index), `0042` (autonomous_sessions.params +
+  schedule due-index), `0043` (notifications read-index), `0044`
+  (users.autonomous_enabled), `0045` (per-trigger max_cost_usd on
+  watches + schedules), `0046` (autonomous_findings — persisted run
+  work-product), `0047` (autonomous_artifacts + the `emit_artifacts`
+  opt-in flag on schedules/watches, Donna #8). `contract_relationships`
+  remains a sketch — it is **not** created by any migration (see the M4+
+  sketched section).
 
 Migration conventions:
 - Every migration is reversible (`downgrade()` always implemented).

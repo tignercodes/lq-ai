@@ -12,8 +12,11 @@
     matters: 'Matters',
     skills: 'Skills',
     knowledge: 'Knowledge',
+    playbooks: 'Playbooks',
+    tabular: 'Tabular Review',
     'saved-prompts': 'Saved Prompts',
     learn: 'Learn',
+    autonomous: 'Autonomous',
     admin: 'Admin'
   };
 

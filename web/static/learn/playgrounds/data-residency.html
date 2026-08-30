@@ -636,6 +636,24 @@ const DATA_NODES = [
     ],
     meta: { table: 'saved_prompts', migration: '0011' },
   },
+  {
+    id: 'autonomous',
+    label: 'Autonomous Layer (M4)',
+    sub: 'autonomous_sessions + 6 more tables',
+    store: 'postgres',
+    zone: 'inside',
+    x: 60, y: 500,
+    what: 'The M4 Autonomous Layer\'s seven tables — autonomous_sessions (run state + JSONB receipt), autonomous_schedules, autonomous_watches, autonomous_memory (per-user, system-proposes / user-owns), precedent_entries, autonomous_notifications, and project_context_proposals. Per-user memory, precedents, and session receipts never leave the deployment. Autonomous inference takes the SAME gateway anonymization path as interactive chat — the executor routes every model call through the gateway, so the data-residency story for an autonomous run is identical to a chat send.',
+    retention: 'Sessions + receipts retained until operator purges; memory/precedents until the user dismisses them.',
+    encryption: 'Postgres at rest.',
+    access: 'Owning user + admins. arq-worker (autonomous executor) service account.',
+    files: [
+      'api/app/autonomous/receipt.py',
+      'api/app/autonomous/guard.py',
+      'api/app/models/autonomous.py',
+    ],
+    meta: { tables: 'autonomous_sessions, autonomous_schedules, autonomous_watches, autonomous_memory, precedent_entries, autonomous_notifications, project_context_proposals', inference: 'via gateway (same anonymization path)', status: 'M4 — shipped' },
+  },
   // --- MinIO ---
   {
     id: 'uploaded-files',
@@ -717,6 +735,16 @@ const PROVIDER_NODES = [
       'gateway/app/router.py',
       'gateway/app/providers/anthropic.py',
       'gateway/app/providers/openai.py',
+    ],
+  },
+  {
+    id: 'smtp-notify',
+    label: 'SMTP notify (M4 — optional)',
+    sub: 'operator-configured · OFF by default',
+    x: 764, y: 300,
+    what: 'The ONE new (optional) egress the M4 Autonomous Layer can introduce: when an autonomous run finishes, it can email a notification. This is operator-configured and OFF by default — no SMTP server means no email egress. When enabled, only a notification (e.g. "session completed, N findings") leaves; never document content or raw entity values. The notify tool is the delivery-phase grant and routes through the same audited chokepoint as every other tool call.',
+    files: [
+      'api/app/autonomous/notify_email.py',
     ],
   },
   {
@@ -1066,7 +1094,7 @@ function renderOutput() {
 
   const privacyHonest = `
     <div class="warn">
-      <strong>Anonymization Layer (M2, not yet running):</strong> The PRD describes entity substitution on the request path — swapping named entities for stable placeholders before they leave the deployment. In M1, the config slot exists but the middleware does not run. Read <a class="file" href="${REPO}docs/HONEST-STATE.md" target="_blank" rel="noopener">docs/HONEST-STATE.md §3.2</a> and <a class="file" href="${REPO}gateway/app/api/admin.py" target="_blank" rel="noopener">gateway/app/api/admin.py:270-282</a> (returns 501) to verify.
+      <strong>Anonymization Layer (M2 — running):</strong> Entity substitution runs on the request path — named entities are swapped for stable pseudonyms before the payload leaves the deployment, and the response is rehydrated inside the deployment (wired at <a class="file" href="${REPO}gateway/app/main.py" target="_blank" rel="noopener">gateway/app/main.py</a>). Honest caveat: Presidio default-recognizer recall/precision on a legal corpus is empirically unmeasured — see <a class="file" href="${REPO}docs/security/anonymization.md#whats-validated-vs-whats-unvalidated" target="_blank" rel="noopener">anonymization.md</a> and DE-282 for the risk framing.
     </div>`;
 
   verifyHtml += gatewayBoundary + networkTopology + privacyHonest;
@@ -1092,7 +1120,9 @@ function renderOutput() {
     describeHtml += `<p>The Inference Gateway (<a class="file" href="${REPO}gateway/app/router.py" target="_blank" rel="noopener">gateway/app/router.py</a>) is the ONLY component that makes outbound calls. A procurement team can read this file to verify there is no other egress path. Every other component — API, ingest worker, web, Postgres, MinIO, Redis — is strictly internal.</p>`;
   }
 
-  describeHtml += `<p><strong>What stays inside:</strong> Chat messages, sessions, projects, skills, knowledge bases + embeddings, uploaded files, audit log, routing log, users, saved prompts, provider API keys.</p>`;
+  describeHtml += `<p><strong>What stays inside:</strong> Chat messages, sessions, projects, skills, knowledge bases + embeddings, uploaded files, audit log, routing log, users, saved prompts, provider API keys, and the M4 Autonomous Layer's seven tables (autonomous_sessions, autonomous_schedules, autonomous_watches, autonomous_memory, precedent_entries, autonomous_notifications, project_context_proposals) — including per-user memory, precedents, and session receipts.</p>`;
+
+  describeHtml += `<p style="color:var(--text-dim)"><strong>Autonomous Layer (M4 — shipped):</strong> An autonomous run routes every model call through the Gateway, so its inference takes the same anonymization path as an interactive chat — the data-residency story is identical. The one new (optional) egress is SMTP email notification: operator-configured and OFF by default, and even when enabled only a notification leaves — never document content. The notify action is audited through the same chokepoint as every other tool call.</p>`;
 
   if (state.mode !== 'air-gapped') {
     describeHtml += `<p><strong>What crosses the boundary:</strong> The assembled inference payload (system prompt from resolved skills + relevant RAG chunks + user message). The model response returns through the same channel and is persisted inside the deployment.</p>`;
@@ -1102,7 +1132,7 @@ function renderOutput() {
 
   describeHtml += `<p><strong>No phone-home, analytics, or telemetry.</strong> Verify: <a class="file" href="${REPO}docker-compose.yml" target="_blank" rel="noopener">docker-compose.yml</a> defines no analytics services. The <a class="file" href="${REPO}gateway/app/router.py" target="_blank" rel="noopener">gateway/app/router.py</a> makes no calls except to the configured inference providers. The web bundle is served from the self-hosted container — no CDN fonts or scripts in an air-gapped deployment.</p>`;
 
-  describeHtml += `<p style="color:var(--api);font-size:11px"><strong>M2 note:</strong> The Anonymization Layer (PRD §4.7) will add entity substitution on the request path. In M1 it is not running — the config slot exists but the middleware is absent. See <a class="file" href="${REPO}docs/HONEST-STATE.md" target="_blank" rel="noopener">HONEST-STATE.md §3.2</a>.</p>`;
+  describeHtml += `<p style="color:var(--api);font-size:11px"><strong>Anonymization note:</strong> The Anonymization Layer (PRD §4.7) performs entity substitution on the request path and is running as of M2 (<a class="file" href="${REPO}gateway/app/main.py" target="_blank" rel="noopener">gateway/app/main.py</a>). For non-privileged chats the model sees pseudonyms; the mapping back to originals stays inside the deployment. See <a class="file" href="${REPO}docs/HONEST-STATE.md" target="_blank" rel="noopener">HONEST-STATE.md §3.2</a>.</p>`;
 
   if (state.selectedNode) {
     const n = findNode(state.selectedNode);

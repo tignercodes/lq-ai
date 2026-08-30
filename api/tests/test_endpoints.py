@@ -60,6 +60,19 @@ _PARAM_VALUES: dict[str, str] = {
     "user_id": _DUMMY_UUID,
     "interaction_id": _DUMMY_UUID,
     "job_id": _DUMMY_UUID,
+    # M3-A2 + M3-A6 — playbook surface
+    "playbook_id": _DUMMY_UUID,
+    "execution_id": _DUMMY_UUID,
+    "generation_id": _DUMMY_UUID,
+    # M3-D4 — admin intake-bridges surface
+    "workspace_id": _DUMMY_UUID,
+    "tenant_id": _DUMMY_UUID,
+    # WS3b — research surface
+    "cluster_id": "1",
+    "opinion_id": "1",
+    # WS2/PR4b — MCP registry admin surface
+    "server": "acme-mcp",
+    "tool": "read_doc",
 }
 
 
@@ -88,6 +101,8 @@ IMPLEMENTED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/api/v1/auth/refresh"),
     ("POST", "/api/v1/auth/logout"),
     ("GET", "/api/v1/users/me"),
+    # Donna-3 — caller-scoped profile edit (display_name)
+    ("PATCH", "/api/v1/users/me"),
     # B2 — first-run admin + forced password change
     ("POST", "/api/v1/auth/change-password"),
     # D5 — MFA enrollment + verification
@@ -163,15 +178,59 @@ IMPLEMENTED_ROUTES: set[tuple[str, str]] = {
     ("GET", "/api/v1/chats/{chat_id}/receipts/export.jsonl"),
     # D0 — Model availability (proxy to gateway /v1/models)
     ("GET", "/api/v1/models"),
+    # M3-0.1 / DE-283 — unauthenticated fresh-install state probe
+    ("GET", "/api/v1/admin/bootstrap-status"),
     # D0.5 — Admin alias CRUD proxy
     ("GET", "/api/v1/admin/aliases"),
     ("GET", "/api/v1/admin/aliases/{name}"),
     ("POST", "/api/v1/admin/aliases"),
     ("PATCH", "/api/v1/admin/aliases/{name}"),
     ("DELETE", "/api/v1/admin/aliases/{name}"),
+    # Donna #7 — runtime provider-key (BYOK) admin proxy
+    ("GET", "/api/v1/admin/provider-keys"),
+    ("POST", "/api/v1/admin/provider-keys"),
+    ("PATCH", "/api/v1/admin/provider-keys/{provider}"),
+    ("DELETE", "/api/v1/admin/provider-keys/{provider}"),
     ("GET", "/api/v1/admin/config"),
     # D3 — admin audit-log read endpoint
     ("GET", "/api/v1/admin/audit-log"),
+    # M3-0.3 / DE-276 — admin ingest-health aggregate
+    ("GET", "/api/v1/admin/ingest-health"),
+    # M3-A2 — Playbook executor surface
+    ("POST", "/api/v1/playbooks/{playbook_id}/execute"),
+    ("GET", "/api/v1/playbook-executions/{execution_id}"),
+    # M3-A4 — Playbook list + detail
+    ("GET", "/api/v1/playbooks"),
+    ("GET", "/api/v1/playbooks/{playbook_id}"),
+    # M3-A6 — Playbook CRUD (Phase 2) + Easy Playbook wizard (Phase 5)
+    ("POST", "/api/v1/playbooks"),
+    ("PATCH", "/api/v1/playbooks/{playbook_id}"),
+    ("DELETE", "/api/v1/playbooks/{playbook_id}"),
+    ("POST", "/api/v1/playbooks/easy"),
+    ("GET", "/api/v1/playbooks/easy/{generation_id}"),
+    # M3-C2 — Tabular / Multi-Document Review surface (PRD §3.14).
+    # Six method-tuples across five unique paths (cancel is a
+    # sub-resource of /executions/{id}).
+    ("POST", "/api/v1/tabular/preview-cost"),
+    ("POST", "/api/v1/tabular/execute"),
+    ("GET", "/api/v1/tabular/executions"),
+    ("GET", "/api/v1/tabular/executions/{execution_id}"),
+    ("DELETE", "/api/v1/tabular/executions/{execution_id}"),
+    ("POST", "/api/v1/tabular/executions/{execution_id}/cancel"),
+    # M3-C4a — XLSX/CSV export.
+    ("GET", "/api/v1/tabular/executions/{execution_id}/export"),
+    # M3-B1 — Word add-in admin manifest generation
+    ("GET", "/api/v1/admin/word-addin/manifest"),
+    # M3-B8 — Word add-in version handshake (unauthenticated)
+    ("GET", "/api/v1/word-addin/version"),
+    # M3-D1 — slack-bridge persistence surface (bridge-token bearer auth)
+    ("POST", "/api/v1/integrations/slack/workspaces"),
+    # M3-D3 — teams-bridge persistence surface (bridge-token bearer auth)
+    ("POST", "/api/v1/integrations/teams/tenants"),
+    # M3-D4 — admin intake-bridges surface
+    ("GET", "/api/v1/admin/intake-bridges"),
+    ("DELETE", "/api/v1/admin/intake-bridges/slack/{workspace_id}"),
+    ("DELETE", "/api/v1/admin/intake-bridges/teams/{tenant_id}"),
     # D4 — Organization Profile singleton
     ("GET", "/api/v1/organization-profile"),
     ("PUT", "/api/v1/organization-profile"),
@@ -219,6 +278,51 @@ IMPLEMENTED_ROUTES: set[tuple[str, str]] = {
     ("GET", "/api/v1/skills/autocomplete"),
     ("GET", "/api/v1/user-skills/{skill_id}/versions"),
     ("GET", "/api/v1/knowledge-bases/{kb_id}/files"),
+    # M4 — Autonomous Layer (opt-in) + Phase-1 run-now. Fully implemented;
+    # each has dedicated coverage under tests/autonomous/, so they must be
+    # excluded from this 501-scaffold sweep.
+    ("GET", "/api/v1/autonomous/memory"),
+    ("DELETE", "/api/v1/autonomous/memory/{memory_id}"),
+    ("POST", "/api/v1/autonomous/memory/{memory_id}/dismiss"),
+    ("POST", "/api/v1/autonomous/memory/{memory_id}/keep"),
+    ("GET", "/api/v1/autonomous/notifications"),
+    ("POST", "/api/v1/autonomous/notifications/{notification_id}/read"),
+    ("GET", "/api/v1/autonomous/precedents"),
+    ("POST", "/api/v1/autonomous/precedents/{precedent_id}/dismiss"),
+    ("POST", "/api/v1/autonomous/precedents/{precedent_id}/promote"),
+    ("GET", "/api/v1/autonomous/project-context-proposals"),
+    ("POST", "/api/v1/autonomous/project-context-proposals/{proposal_id}/accept"),
+    ("POST", "/api/v1/autonomous/project-context-proposals/{proposal_id}/reject"),
+    ("POST", "/api/v1/autonomous/run-now"),
+    ("GET", "/api/v1/autonomous/schedules"),
+    ("POST", "/api/v1/autonomous/schedules"),
+    ("DELETE", "/api/v1/autonomous/schedules/{schedule_id}"),
+    ("PATCH", "/api/v1/autonomous/schedules/{schedule_id}"),
+    ("GET", "/api/v1/autonomous/sessions"),
+    ("GET", "/api/v1/autonomous/sessions/{session_id}"),
+    ("GET", "/api/v1/autonomous/sessions/{session_id}/artifacts"),
+    ("GET", "/api/v1/autonomous/sessions/{session_id}/findings"),
+    ("POST", "/api/v1/autonomous/sessions/{session_id}/halt"),
+    ("GET", "/api/v1/autonomous/watches"),
+    ("POST", "/api/v1/autonomous/watches"),
+    ("DELETE", "/api/v1/autonomous/watches/{watch_id}"),
+    ("PATCH", "/api/v1/autonomous/watches/{watch_id}"),
+    # WS3b — case-law research surface
+    ("GET", "/api/v1/research/capabilities"),
+    ("POST", "/api/v1/research/verify-citations"),
+    ("POST", "/api/v1/research/search"),
+    ("GET", "/api/v1/research/clusters/{cluster_id}"),
+    ("GET", "/api/v1/research/opinions/{opinion_id}"),
+    ("POST", "/api/v1/research/find-in-case"),
+    # WS2/PR4b — MCP registry admin surface
+    ("GET", "/api/v1/admin/mcp"),
+    ("POST", "/api/v1/admin/mcp/{server}/refresh"),
+    ("PATCH", "/api/v1/admin/mcp/{server}/tools/{tool}"),
+    # PR4c — per-user MCP OAuth surface
+    ("GET", "/api/v1/mcp/oauth/{server}/authorize"),
+    ("GET", "/api/v1/mcp/oauth/{server}/callback"),
+    ("GET", "/api/v1/mcp/oauth/{server}/status"),
+    ("DELETE", "/api/v1/mcp/oauth/{server}"),
 }
 
 

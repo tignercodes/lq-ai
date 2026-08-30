@@ -25,6 +25,7 @@ export interface Preferences {
 	workspace_layout: WorkspaceLayout;
 	trust_pills: TrustPills;
 	provenance_pills: ProvenancePills;
+	autonomous_enabled: boolean;
 }
 
 export type PreferencesUpdate = Partial<Preferences>;
@@ -44,6 +45,7 @@ export interface User {
 	workspace_layout?: WorkspaceLayout;
 	trust_pills?: TrustPills;
 	provenance_pills?: ProvenancePills;
+	autonomous_enabled?: boolean;
 }
 
 export interface LoginRequest {
@@ -512,6 +514,13 @@ export interface FileMeta {
 	ingestion_error?: string | null;
 	page_count?: number | null;
 	character_count?: number | null;
+	/**
+	 * M3-A6 Phase 6: parsed-content Document UUID, distinct from `id`
+	 * (the File UUID). Null until the C5 parse pipeline writes the
+	 * documents row; the Easy Playbook wizard polls GET /files/{id}
+	 * until this surfaces, then passes it to POST /playbooks/easy.
+	 */
+	document_id?: string | null;
 	created_at: string;
 }
 
@@ -531,8 +540,25 @@ export interface KnowledgeBaseFile {
 	hash_sha256: string;
 	ingestion_status: IngestionStatus;
 	ingestion_error?: string | null;
+	/**
+	 * M3-0.3 / DE-276: document-level ingest status. `ok` is the steady
+	 * state once chunks are embedded; `embed_failed` and `partial` flag
+	 * silent-degrade failures the file-level `ingestion_status` cannot
+	 * detect. `null` for files that haven't yet produced a documents row
+	 * (parse pending / parse failed before document creation — in those
+	 * cases `ingestion_status` already tells the operator).
+	 */
+	ingest_status?: 'ok' | 'embed_failed' | 'partial' | 'parse_failed' | null;
+	ingest_failure_reason?: string | null;
 	page_count?: number | null;
 	character_count?: number | null;
+	/**
+	 * M3-A4: the parsed-content Document UUID, distinct from `id` (the File
+	 * UUID). Null until the C5 parse pipeline produces a documents row.
+	 * Surfaces here so playbook-execute callers can pass the right id without
+	 * a second fetch.
+	 */
+	document_id?: string | null;
 	created_at: string;
 	attached_at: string;
 }
@@ -720,30 +746,30 @@ export interface UsageQuery {
 // ----- Admin users -----
 
 export interface AdminUserRow {
-  id: string;
-  email: string;
-  display_name?: string | null;
-  role: UserRole;
-  is_admin: boolean;
-  mfa_enabled: boolean;
-  must_change_password: boolean;
-  created_at: string;
-  last_login_at?: string | null;
-  deletion_scheduled_at?: string | null;
+	id: string;
+	email: string;
+	display_name?: string | null;
+	role: UserRole;
+	is_admin: boolean;
+	mfa_enabled: boolean;
+	must_change_password: boolean;
+	created_at: string;
+	last_login_at?: string | null;
+	deletion_scheduled_at?: string | null;
 }
 
 export interface AdminUserListResponse {
-  users: AdminUserRow[];
-  total_count: number;
-  limit: number;
-  offset: number;
+	users: AdminUserRow[];
+	total_count: number;
+	limit: number;
+	offset: number;
 }
 
 export interface AdminUserListQuery {
-  role?: UserRole;
-  email_q?: string;
-  limit?: number;
-  offset?: number;
+	role?: UserRole;
+	email_q?: string;
+	limit?: number;
+	offset?: number;
 }
 
 // ----- Teams (D8.1a + D8.1c caller_role) -----
@@ -819,4 +845,365 @@ export interface UserSkillVersion {
 
 export interface UserSkillVersionsResponse {
 	items: UserSkillVersion[];
+}
+
+// ----- Playbooks (M3-A1/A2/A3/A4) -----
+
+export type PositionSeverity = 'critical' | 'high' | 'medium' | 'low';
+
+export type PlaybookExecutionStatus = 'pending' | 'running' | 'completed' | 'error';
+
+export type PlaybookPositionVerdict =
+	| 'matches_standard'
+	| 'matches_fallback'
+	| 'deviates'
+	| 'missing';
+
+export interface FallbackTier {
+	rank: number;
+	description: string;
+	language: string;
+}
+
+export interface Position {
+	id: string;
+	issue: string;
+	description: string;
+	standard_language: string;
+	fallback_tiers: FallbackTier[];
+	redline_strategy: string;
+	severity_if_missing: PositionSeverity;
+	detection_keywords: string[];
+	detection_examples: string[];
+	position_order: number;
+}
+
+export interface Playbook {
+	id: string;
+	name: string;
+	contract_type: string;
+	description: string;
+	version: string;
+	created_by: string | null;
+	created_at: string;
+	updated_at: string;
+	positions: Position[];
+}
+
+export interface PlaybookPositionRedline {
+	old_text: string;
+	new_text: string;
+	justification: string;
+}
+
+export interface PlaybookPositionResult {
+	position_id: string;
+	issue: string;
+	severity_if_missing: PositionSeverity;
+	verdict: PlaybookPositionVerdict;
+	confidence: number;
+	matched_fallback_rank: number | null;
+	cited_chunk_ids: string[];
+	matched_text: string;
+	redline: PlaybookPositionRedline | null;
+	justification: string;
+}
+
+export interface PlaybookExecutionSummary {
+	matches_standard: number;
+	matches_fallback: number;
+	deviates: number;
+	missing: number;
+}
+
+export interface PlaybookExecutionResults {
+	schema_version: string;
+	positions: PlaybookPositionResult[];
+	summary: PlaybookExecutionSummary;
+}
+
+export interface PlaybookExecution {
+	id: string;
+	playbook_id: string;
+	target_document_id: string;
+	user_id: string | null;
+	project_id: string | null;
+	status: PlaybookExecutionStatus;
+	results: PlaybookExecutionResults | null;
+	error: string | null;
+	created_at: string;
+	completed_at: string | null;
+}
+
+export interface PlaybookExecutionCreate {
+	target_document_id: string;
+	project_id?: string | null;
+}
+
+// ----- Playbook CRUD + Easy Playbook (M3-A6) -----
+
+/**
+ * Request shape for one position when creating or updating a playbook
+ * (M3-A6). Identical to `Position` minus the server-assigned `id`.
+ * Mirrors `PositionCreate` in `docs/api/backend-openapi.yaml`.
+ */
+export interface PositionCreate {
+	issue: string;
+	description?: string;
+	standard_language: string;
+	fallback_tiers?: FallbackTier[];
+	redline_strategy?: string;
+	severity_if_missing: PositionSeverity;
+	detection_keywords?: string[];
+	detection_examples?: string[];
+	position_order?: number;
+}
+
+/**
+ * Request shape for `POST /api/v1/playbooks` (M3-A6). The server sets
+ * `created_by` to the caller unconditionally — there is no path to mint
+ * a built-in via the HTTP surface.
+ */
+export interface PlaybookCreate {
+	name: string;
+	contract_type: string;
+	description?: string;
+	version?: string;
+	positions?: PositionCreate[];
+}
+
+/**
+ * Request shape for `PATCH /api/v1/playbooks/{id}` (M3-A6). All fields
+ * optional; missing = "leave alone". If `positions` is supplied, the
+ * server **atomically replaces** the entire list. To leave positions
+ * alone, omit; to clear, send `[]`.
+ */
+export interface PlaybookUpdate {
+	name?: string;
+	contract_type?: string;
+	description?: string;
+	version?: string;
+	positions?: PositionCreate[] | null;
+}
+
+export type EasyPlaybookGenerationStatus = 'pending' | 'running' | 'completed' | 'error';
+
+/**
+ * Request shape for `POST /api/v1/playbooks/easy` (M3-A6). The
+ * document corpus the wizard's Step 1 collected, plus the contract
+ * family and an optional caller-supplied playbook name.
+ */
+export interface EasyPlaybookGenerationCreate {
+	document_ids: string[];
+	contract_type: string;
+	name?: string | null;
+	persist_documents_after_generation?: boolean;
+}
+
+/**
+ * One row from `easy_playbook_generations`. Returned by `POST
+ * /api/v1/playbooks/easy` (at `status='pending'`) and by `GET
+ * /api/v1/playbooks/easy/{id}` (the wizard's poll target).
+ * `draft_playbook` is populated only on `status='completed'` and
+ * carries the assembled `PlaybookCreate` shape for the inline editor.
+ */
+export interface EasyPlaybookGeneration {
+	id: string;
+	user_id: string | null;
+	contract_type: string;
+	status: EasyPlaybookGenerationStatus;
+	document_ids: string[];
+	draft_playbook: PlaybookCreate | null;
+	error_message?: string | null;
+	created_at: string;
+}
+
+// ----- Tabular / Multi-Document Review (M3-C2 / M3-C3) -----
+
+/**
+ * Lifecycle states for a `TabularExecution`. Matches the backend
+ * `Literal["pending","running","completed","failed","cancelled"]`
+ * (migration 0036's CHECK constraint on `tabular_executions.status`).
+ * Note: this enum carries a `cancelled` state that the M3-A4 playbook
+ * execution surface does NOT have — tabular runs can be hours long, so
+ * cancellation matters.
+ */
+export type TabularExecutionStatus =
+	| 'pending'
+	| 'running'
+	| 'completed'
+	| 'failed'
+	| 'cancelled';
+
+/**
+ * Per-cell confidence from the Citation Engine cascade. `failed` is
+ * the Decision C-10 state for cells where extraction itself errored —
+ * distinct from the Citation Engine's red `unverified` state on a
+ * non-tabular surface.
+ */
+export type TabularCellConfidence = 'high' | 'medium' | 'low' | 'failed';
+
+/**
+ * One column in a tabular execution's column spec. Mirrors the
+ * backend `ColumnSpec` Pydantic shape (and the skill-side
+ * `lq_ai.columns` frontmatter entry from M3-C1).
+ *
+ * - `ensemble_verification` overrides the skill-level field (M2-D1
+ *   ensemble cascade).
+ * - `minimum_inference_tier` (1-5) overrides the skill-level tier
+ *   floor — high-stakes columns can demand Tier 4+ while routine
+ *   columns route Tier 1.
+ */
+export interface TabularColumnSpec {
+	name: string;
+	query: string;
+	ensemble_verification?: boolean | null;
+	minimum_inference_tier?: number | null;
+}
+
+/**
+ * Lightweight citation projection used inside `TabularCellResult`.
+ * Distinct from the existing `Citation` interface above — the
+ * grid-cell surface only needs the IDs + confidence to render the chip
+ * and route a click to the existing M2-C2 citation drawer.
+ */
+export interface TabularCitation {
+	citation_id: string;
+	document_id: string;
+	chunk_id?: string | null;
+	confidence: TabularCellConfidence;
+}
+
+/**
+ * One cell in the grid. Failed extraction renders as `confidence:
+ * 'failed'` + `error` populated (Decision C-10). Successful
+ * extractions carry the extracted `value` plus the citation list the
+ * Citation Engine grounded it against.
+ *
+ * Decimal-typed fields (`cost_usd`) come over the wire as JSON
+ * strings because the backend uses `Decimal` for monetary precision.
+ */
+export interface TabularCellResult {
+	value: string | null;
+	citations: TabularCitation[];
+	confidence: TabularCellConfidence;
+	tier_used?: number | null;
+	cost_usd?: string | null;
+	error?: string | null;
+}
+
+/**
+ * One row in the tabular grid — all cells for a single document.
+ * Rows are returned in the order of the execution's `document_ids`
+ * array (NOT sorted by document name), so the grid matches the
+ * operator's selection order.
+ */
+export interface TabularRow {
+	document_id: string;
+	document_name: string;
+	cells: Record<string, TabularCellResult>;
+}
+
+/**
+ * Aggregated grid shape persisted in `tabular_executions.results`
+ * once status is `completed`.
+ */
+export interface TabularResults {
+	rows: TabularRow[];
+}
+
+/**
+ * Full execution row returned by every `/api/v1/tabular/executions`
+ * endpoint. The `results` payload is only populated once status is
+ * terminal (`completed`); pending / running rows return `null`.
+ *
+ * Note `error_text` not `error` — matches the migration 0036 column
+ * name + the backend Pydantic field, sidestepping a collision with
+ * the bare `error` field on `PlaybookExecution`.
+ */
+export interface TabularExecution {
+	id: string;
+	user_id: string | null;
+	parent_execution_id: string | null;
+	skill_name: string | null;
+	status: TabularExecutionStatus;
+	document_ids: string[];
+	/**
+	 * Filenames in the same order as `document_ids` — joined from
+	 * `documents → files.filename` at response build time. Lets the
+	 * grid render human-readable headers from execution creation,
+	 * before any row is populated by the worker. Missing entries
+	 * (file soft-deleted between create and fetch) surface as the
+	 * empty string.
+	 */
+	document_names: string[];
+	columns: TabularColumnSpec[];
+	results: TabularResults | null;
+	cost_estimate_usd: string | null;
+	cost_actual_usd: string | null;
+	error_text: string | null;
+	created_at: string;
+	started_at: string | null;
+	completed_at: string | null;
+}
+
+/**
+ * Compact list-shape returned by `GET /api/v1/tabular/executions`.
+ * Drops the (potentially large) `results` payload — operators fetch
+ * the full execution row only when they open one.
+ */
+export interface TabularExecutionSummary {
+	id: string;
+	user_id: string | null;
+	parent_execution_id: string | null;
+	skill_name: string | null;
+	status: TabularExecutionStatus;
+	document_count: number;
+	column_count: number;
+	cost_estimate_usd: string | null;
+	cost_actual_usd: string | null;
+	created_at: string;
+	completed_at: string | null;
+}
+
+/**
+ * Request body for `POST /api/v1/tabular/execute`. Either
+ * `skill_name` (resolved at execution start to snapshot the skill's
+ * `lq_ai.columns`) OR `columns` (ad-hoc spec) is required.
+ *
+ * `confirmed_cost_usd` is the echo of the
+ * `POST /api/v1/tabular/preview-cost` response value; persisting it
+ * gives an audit trail of the operator confirming a specific cost
+ * ceiling before kickoff.
+ */
+export interface TabularExecutionCreate {
+	document_ids: string[];
+	skill_name?: string | null;
+	columns?: TabularColumnSpec[] | null;
+	confirmed_cost_usd?: string | null;
+}
+
+/**
+ * Request body for `POST /api/v1/tabular/preview-cost`. Same shape
+ * as `TabularExecutionCreate` minus the `confirmed_cost_usd` echo —
+ * preview is the operation that produces the cost; confirmation
+ * echoes it back on the subsequent execute call.
+ */
+export interface TabularPreviewCostRequest {
+	document_ids: string[];
+	skill_name?: string | null;
+	columns?: TabularColumnSpec[] | null;
+}
+
+/**
+ * Response from `POST /api/v1/tabular/preview-cost`. The UI uses
+ * `estimated_cost_usd` to decide whether to render the
+ * confirmation-checkbox gate (Decision C-5: gate above $1.00, no
+ * friction below).
+ */
+export interface TabularPreviewCostResponse {
+	cells_count: number;
+	estimated_tokens: number;
+	estimated_cost_usd: string;
+	per_tier_breakdown: Record<string, number>;
 }

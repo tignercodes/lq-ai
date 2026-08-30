@@ -3,6 +3,8 @@
 > **Purpose:** Ground orientation for any agentic coding assistant working on the LQ.AI codebase. Read this first; it points at the right reference for any decision and lays out the project's standards in one place.
 >
 > **Audience:** Claude Code, Cursor, Aider, or any human or agent making implementation decisions. Read in full before the first contribution; refer back as needed.
+>
+> **New here?** Start with the [cold-start guide for coding agents](docs/contribute/coding-agent-onboarding.md) — it gives you the read-order, the build loop, the dev-environment hard rules, and how to take a roadmap item to a merged PR. Then keep this file open as your decision reference.
 
 ---
 
@@ -172,6 +174,18 @@ Skills are the canonical artifact of value (per PRD §7.1). When implementing sk
 
 A few specific patterns that work well for agentic implementation on this project:
 
+### The build loop
+
+Run this for every non-trivial change — it is battle-tested across M1–M4 and the post-v0.4.0 integration run:
+
+1. **Verify the ask against the code first** — before writing anything. Most requests carry a wrong premise or a wider blast radius than reported; read the cited files and confirm the problem is real and where the asker thinks it is.
+2. **Surface the forks** — if the task hides an architectural / product / authz decision, a scope expansion, or a deferral, stop and put the options (with a recommendation) to the maintainer. Don't decide unilaterally.
+3. **Build in reviewed increments** — independent tasks, each: implement → spec-compliance review → code-quality review → fix → re-review. (The `superpowers:subagent-driven-development` skill encodes this.)
+4. **Run the gates yourself** — evidence before claims (see Testing + the collision guards below).
+5. **Ship** — `git commit -s` + the co-author trailer, push **both** remotes (`origin` + `tucuxi`, kept identical on `main`), open the PR, watch CI, merge per the gating rule, report the squash SHA.
+
+The full step-by-step, including merge-gating and dev-environment rules, is in the [cold-start guide](docs/contribute/coding-agent-onboarding.md).
+
 ### Read before writing
 
 Before implementing a task, read:
@@ -180,6 +194,45 @@ Before implementing a task, read:
 2. The relevant OpenAPI section if the task touches an API endpoint.
 3. The relevant DB schema section if the task touches the database.
 4. Any existing implementation in the same area (don't rebuild what exists).
+
+### Common pitfalls (catch at write-time, not test-time)
+
+A few traps that have bitten this codebase more than once. Each has a fix recipe; follow it the first time and the bug never surfaces in your branch.
+
+**`DELETE` endpoints returning `204 No Content`** — FastAPI's default `JSONResponse` is body-emitting and asserts at import time when `status_code=204`. The assertion (`Status code 204 must not have a response body`) fires during test collection, collapsing the whole test suite — not just the new endpoint's tests. Recurred between M3-C2 (fix in commit `c613c43`) and M3-D4 because the recipe lived only in code comments.
+
+Recipe:
+
+```python
+from fastapi import Response, status
+
+@router.delete(
+    "/things/{thing_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,                       # critical — overrides default JSONResponse
+)
+async def soft_delete_thing(...) -> Response:
+    ...
+    return Response(status_code=status.HTTP_204_NO_CONTENT)  # explicit empty return
+```
+
+Both `response_class=Response` AND the explicit `return Response(...)` are required. Omitting either resurfaces the assertion.
+
+**Test-suite collision guards** — these crash the *whole* api suite at collection, not just the offending test:
+
+- A new fully-implemented route must be added to `IMPLEMENTED_ROUTES` (`api/tests/test_endpoints.py`) **and** bump the exact path count + `EXPECTED_PATHS` set in `api/tests/test_openapi.py`. The count is pinned; an off-by-one fails collection.
+- `docs/api/backend-openapi.yaml` does **not** parse with plain `yaml.safe_load` (pre-existing) — `test_openapi.py` is the authoritative conformance check; run it rather than eyeballing.
+- Decimal cost fields serialize as JSON **strings** — type them `string`, not `number`.
+
+### Dev-environment hard rules
+
+These corrupt the running dev stack or crash CI if violated:
+
+- **NEVER run host-side `alembic upgrade` against the live dev DB** (`127.0.0.1:15432/lq_ai`) — it desyncs the running stack and crash-loops the api trio. Verify migrations on a throwaway `pgvector/pgvector:pg16` container (conftest auto-migrates); apply to the dev stack by rebuilding the workers, not host alembic.
+- **When a migration lands, rebuild `api` + `arq-worker` + `ingest-worker` together** — stale siblings crash-loop on a revision mismatch.
+- **NEVER `docker compose down -v`** — it wipes volumes including expensive-to-recreate acceptance data. Rebuild a single service instead.
+- **The `web` container serves a pre-built static bundle (no HMR)** — rebuild `web` before debugging a UI change that "isn't appearing."
+- **Run BOTH `ruff format` and `ruff check`** locally — CI runs them as separate gates.
 
 ### Surface ideas as DE-XXX
 
@@ -217,6 +270,7 @@ When you need to find something quickly:
 | Skill conventions | [docs/skill-authoring-guide.md](docs/skill-authoring-guide.md) |
 | What's already implemented | Existing code in `api/`, `gateway/`, `web/` |
 | What's deferred | [docs/PRD.md §9](docs/PRD.md#9-deferred-enhancements-and-identified-future-work) |
+| Contributor-pickup mini-PRDs | [docs/proposals/](docs/proposals/) |
 | Security policy | [SECURITY.md](SECURITY.md) |
 | Conduct policy | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |
 

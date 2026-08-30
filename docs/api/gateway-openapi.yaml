@@ -34,7 +34,7 @@ info:
       GET  /admin/v1/usage                (admin.py — 501 stub)
       GET  /admin/v1/tier-config          (admin.py — live)
       PATCH /admin/v1/tier-config         (admin.py — live)
-      GET  /admin/v1/anonymization-config (admin.py — 501 stub)
+      GET  /admin/v1/anonymization-config (admin.py — live)
       GET  /admin/v1/config               (admin.py — live)
       GET  /admin/v1/aliases              (admin.py — live)
       POST /admin/v1/aliases              (admin.py — live)
@@ -66,6 +66,8 @@ servers:
 tags:
   - name: inference
     description: OpenAI-compatible inference endpoints
+  - name: tools
+    description: Tool-call HTTP transport (WS3 / ADR 0014)
   - name: admin
     description: Gateway configuration and operations
   - name: health
@@ -337,6 +339,143 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/GatewayError'}
 
+  # ----------- TOOLS (WS3 / ADR 0014 — tool-call HTTP transport) -----------
+  /v1/tools/{provider}:
+    get:
+      tags: [tools]
+      summary: Discover a tool provider's available tools
+      description: |
+        Returns the live ``list_tools()`` response from the named tool provider.
+        Callers use this to discover available tools and their parameter schemas
+        before invoking via ``POST /v1/tools/{provider}/{tool}``.
+
+        The per-user OAuth token for ``auth: oauth`` MCP servers is supplied via
+        the ``X-LQ-AI-User-Token`` request header (PR4c supplies it). A header
+        is used instead of a query parameter because query strings are written
+        to uvicorn access logs in plaintext; this token must never appear in
+        logs. For ``none`` / ``bearer`` providers the token is ignored and
+        **never logged**.
+
+        Gated by the gateway key (same as the invoke transport).
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: {type: string}
+          description: Name of a configured tool provider (e.g. ``courtlistener``).
+        - name: X-LQ-AI-User-Token
+          in: header
+          required: false
+          schema: {type: string}
+          description: |
+            Optional per-user OAuth token forwarded to the adapter for
+            ``auth: oauth`` MCP servers. Carried as a header (not a query
+            param) so it is never written to access logs. Ignored for
+            ``none`` / ``bearer`` auth providers. Never logged.
+      responses:
+        '200':
+          description: Tool list returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolDiscoveryResponse'
+        '401':
+          description: Missing or invalid X-LQ-AI-Gateway-Key
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '404':
+          description: Provider name not in the tool-provider registry
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '502':
+          description: Upstream tool provider returned an error during list_tools
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+
+  /v1/tools/{provider}/{tool}:
+    post:
+      tags: [tools]
+      summary: Invoke a configured tool provider
+      description: |
+        Dispatches a single tool call to the named ``provider`` / ``tool``
+        combination. The gateway validates the caller's gateway key (when
+        ``LQ_AI_GATEWAY_KEY`` is set), checks the provider is in the live
+        tool-provider registry, enforces the ``max_allowed_tier`` ceiling
+        against the provider's configured ``egress_tier``, and delegates to
+        the adapter (echo / CourtListener / MCP). The egress request is
+        written to ``tool_egress_log`` for audit.
+
+        Per ADR 0014: tool providers are distinct from inference providers.
+        They are configured under ``tool_providers`` in ``gateway.yaml`` and
+        carry their own egress tier (1-5) and allowlist policy. The gateway
+        refuses any provider not in the registry with 403.
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: {type: string}
+          description: Name of a configured tool provider (e.g. ``courtlistener``).
+        - name: tool
+          in: path
+          required: true
+          schema: {type: string}
+          description: Tool name within the provider (e.g. ``search_opinions``).
+        - name: X-LQ-AI-User-Token
+          in: header
+          required: false
+          schema: {type: string}
+          description: |
+            Optional per-user OAuth token forwarded to the adapter for
+            ``auth: oauth`` MCP servers. Carried as a header (not a query
+            param or request body field) so it is never written to access
+            logs. Ignored for ``none`` / ``bearer`` auth providers. Never
+            logged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolCallRequest'
+      responses:
+        '200':
+          description: Tool call succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolCallResponse'
+        '400':
+          description: Unknown tool name or malformed request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '401':
+          description: Missing or invalid X-LQ-AI-Gateway-Key
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '403':
+          description: Provider not in registry, or egress tier exceeds max_allowed_tier
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '429':
+          description: Tool provider rate limit exceeded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '502':
+          description: Upstream tool provider returned an error
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+
   # ----------- HEALTH (PRD §4.3 — liveness/readiness) -----------
   /health:
     get:
@@ -504,11 +643,11 @@ paths:
       tags: [admin]
       summary: Get current anonymization configuration (M2)
       description: |
-        M1 status: route exists in code (gateway/app/api/admin.py:270-282)
-        but returns 501 — the anonymization middleware is not running. The
-        config schema loads via gateway.yaml but is not enforced. Full
-        implementation lands with the M2 anonymization middleware (PRD §4.7).
-        See docs/HONEST-STATE.md §3.2.
+        Returns the loaded anonymization block from gateway.yaml — `enabled`,
+        `apply_at_tiers`, and the pass-through keys (`entity_types`, etc.).
+        The M2 anonymization middleware shipped and runs (pre/post
+        pseudonymization wired in gateway/app/main.py; PRD §4.7), so this read
+        surface reflects the live config. See docs/HONEST-STATE.md §3.2.
       responses:
         '200':
           description: Anonymization configuration
@@ -516,14 +655,17 @@ paths:
             application/json:
               schema:
                 type: object
-                additionalProperties: true
+                properties:
+                  anonymization:
+                    type: object
+                    additionalProperties: true
     patch:
       tags: [admin]
       summary: Partial update to anonymization configuration (M2)
       description: |
-        M1 status: NOT yet in code — this PATCH route does not exist in
-        gateway/app/api/admin.py at M1. The GET returns 501; the PATCH
-        lands with the M2 anonymization middleware alongside it.
+        Status: the PATCH (write) surface is NOT yet in code — only the GET
+        (read) surface is live in gateway/app/api/admin.py. The write path
+        lands with the anonymization admin UI.
         Admin-only. Audited. Updates take effect for new requests immediately.
       requestBody:
         required: true
@@ -708,6 +850,130 @@ paths:
               schema: {$ref: '#/components/schemas/GatewayError'}
         '409':
           description: Alias is referenced as a default and cannot be removed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+
+  /admin/v1/provider-keys:
+    get:
+      tags: [admin]
+      summary: List provider-key status (secret-safe)
+      description: |
+        Donna #7 (runtime BYOK). Returns a status row per configured
+        provider: whether it has a routable adapter, which key source it
+        uses (env vs encrypted-at-rest), and the last 4 characters of the
+        resolved key. NEVER returns a full key or the encrypted token.
+      security:
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: Provider-key status list
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderKeyList'}
+    post:
+      tags: [admin]
+      summary: Set/replace a provider's runtime key and hot-apply it
+      description: |
+        Encrypts the plaintext key with the gateway master key
+        (LQ_AI_GATEWAY_MASTER_KEY), persists `api_key_encrypted` to
+        gateway.yaml (clearing any `api_key_env`), reloads, and swaps the
+        rebuilt adapter into the live registry with no restart. The
+        response carries only the secret-safe status (no key, no token).
+        400 when the master key is unset; 404 when the provider is not a
+        configured entry (adding a new provider is out of scope — that is
+        an operator edit of gateway.yaml).
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProviderKeySetRequest'}
+      responses:
+        '200':
+          description: Key applied; provider status returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderKeyStatus'}
+        '400':
+          description: Master key (LQ_AI_GATEWAY_MASTER_KEY) is not set
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '404':
+          description: Provider not configured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '422':
+          description: Reload validation failed (config rolled back)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+
+  /admin/v1/provider-keys/{provider}:
+    parameters:
+      - in: path
+        name: provider
+        required: true
+        schema: {type: string}
+    patch:
+      tags: [admin]
+      summary: Rotate the runtime key on a configured provider
+      description: |
+        Same mechanics as POST /admin/v1/provider-keys; the provider name
+        comes from the path. The displaced adapter is retired (closed at
+        shutdown) and the rebuilt one swapped in. Response is secret-safe.
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProviderKeyRotateRequest'}
+      responses:
+        '200':
+          description: Key rotated; provider status returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderKeyStatus'}
+        '400':
+          description: Master key (LQ_AI_GATEWAY_MASTER_KEY) is not set
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '404':
+          description: Provider not configured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '422':
+          description: Reload validation failed (config rolled back)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+    delete:
+      tags: [admin]
+      summary: Revoke a provider's runtime key
+      description: |
+        Deletes `api_key_encrypted` from gateway.yaml, reloads, and pops the
+        provider's live adapter (it routes 503 afterward). Only runtime
+        (encrypted-at-rest) keys can be revoked through this API; an
+        env-sourced key is owned by the operator's environment and returns
+        409.
+      security:
+        - apiKeyAuth: []
+      responses:
+        '204':
+          description: Runtime key revoked
+        '404':
+          description: Provider not configured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GatewayError'}
+        '409':
+          description: Provider has no runtime key to revoke (e.g., env-sourced)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/GatewayError'}
@@ -906,9 +1172,11 @@ components:
           enum: [1, 2, 3, 4, 5]
           description: |
             Tier the request would land at if dispatched at this id.
-            Present on ``provider_native`` rows; omitted on aliases
-            (the alias may resolve to different providers via fallback,
-            so the tier is settled per-request, not per-alias).
+            Present on ``provider_native`` rows and on ``alias`` rows
+            (where it is the tier of the alias's *primary* resolution).
+            For an alias the tier actually applied can still differ
+            per-request if a fallback step runs, so treat it as the
+            expected/primary tier rather than a guarantee.
         provider_type:
           type: string
           enum: [anthropic, openai, vertex, cohere, azure_openai, bedrock, ollama, vllm, openai_compatible]
@@ -916,6 +1184,21 @@ components:
             For ``provider_native`` rows: the provider's ``type``
             (``anthropic``, ``ollama``, …). Lets clients group rows
             under user-friendly section headers.
+        lq_ai_resolves_to:
+          type: string
+          description: |
+            ``alias`` rows only: the ``<provider_name>/<native_model>``
+            the alias resolves to today (its primary target), e.g.
+            ``"anthropic-prod/claude-opus-4-7"``. Absent on
+            ``provider_native`` rows. Optional — surfaced so a client
+            can show what an alias currently points at.
+        lq_ai_fallback_count:
+          type: integer
+          description: |
+            ``alias`` rows: how many entries are in the alias's fallback
+            chain after the primary. Present only when the alias has at
+            least one fallback (value ``> 0``); absent when there are no
+            fallbacks and on ``provider_native`` rows. Optional.
 
     AliasFallback:
       type: object
@@ -962,6 +1245,160 @@ components:
           type: array
           items: {$ref: '#/components/schemas/AliasFallback'}
 
+    ProviderKeySetRequest:
+      type: object
+      required: [provider, api_key]
+      properties:
+        provider:
+          type: string
+          minLength: 1
+          description: Name of an already-configured provider entry.
+        api_key:
+          type: string
+          minLength: 1
+          description: |
+            Plaintext provider key. Encrypted with the gateway master key
+            before it touches disk; never echoed back in any response.
+
+    ProviderKeyRotateRequest:
+      type: object
+      required: [api_key]
+      properties:
+        api_key:
+          type: string
+          minLength: 1
+          description: |
+            Replacement plaintext provider key. Same handling as
+            ProviderKeySetRequest.api_key.
+
+    ProviderKeyStatus:
+      type: object
+      required: [provider, type, configured, last4, source]
+      description: |
+        Secret-safe status for one provider. Carries at most the last 4
+        characters of the resolved key — never the full key or token.
+      properties:
+        provider: {type: string}
+        type:
+          type: string
+          nullable: true
+          enum: [anthropic, openai, vertex, cohere, azure_openai, bedrock, ollama, vllm, openai_compatible, null]
+          description: |
+            The provider's adapter type. Null only in the rare race where a
+            provider is removed between the write and the status read-back on
+            a single-provider (POST/PATCH) response; never null on the list.
+        configured:
+          type: boolean
+          description: |
+            True when the provider has a live, routable adapter (its key
+            resolved). This is the honest signal: a keyless or unresolvable
+            provider is false.
+        last4:
+          type: string
+          nullable: true
+          minLength: 4
+          maxLength: 4
+          description: |
+            Last 4 characters of the resolved key, or null when the key is
+            absent, unresolvable, or shorter than 4 characters.
+        source:
+          type: string
+          nullable: true
+          enum: [env, runtime, null]
+          description: |
+            Key source: `runtime` (encrypted-at-rest in gateway.yaml),
+            `env` (api_key_env), or null (no key configured).
+
+    ProviderKeyList:
+      type: object
+      required: [provider_keys]
+      properties:
+        provider_keys:
+          type: array
+          items: {$ref: '#/components/schemas/ProviderKeyStatus'}
+
+    ToolCallRequest:
+      type: object
+      required: [args]
+      properties:
+        args:
+          type: object
+          additionalProperties: true
+          description: |
+            Arbitrary key/value arguments forwarded to the tool adapter.
+            Schema is tool-specific; the gateway passes the object through
+            without validation.
+        max_allowed_tier:
+          type: integer
+          minimum: 1
+          maximum: 5
+          nullable: true
+          description: |
+            Optional egress-tier ceiling. If the provider's ``egress_tier``
+            is higher than this value the gateway refuses with 403
+            (``egress_refused``). Omit to allow any tier.
+
+    ToolDiscoveryResponse:
+      type: object
+      required: [provider, tools]
+      properties:
+        provider:
+          type: string
+          description: The configured tool provider name.
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolSpec'
+
+    ToolSpec:
+      type: object
+      required: [name, description, parameters, read_only, destructive, requires_confirmation]
+      properties:
+        name:
+          type: string
+          description: Tool name, unique within the provider.
+        description:
+          type: string
+          description: Human-readable description of what the tool does.
+        parameters:
+          type: object
+          additionalProperties: true
+          description: |
+            JSON Schema describing the tool's argument object. Callers
+            use this to validate args before invoking via POST.
+        read_only:
+          type: boolean
+          description: True if the tool only reads data (no side-effects).
+        destructive:
+          type: boolean
+          description: True if the tool may permanently destroy or modify data.
+        requires_confirmation:
+          type: boolean
+          description: |
+            True if the tool should prompt the user for confirmation before
+            invoking (e.g. filing a document, sending a message).
+
+    ToolCallResponse:
+      type: object
+      required: [provider, tool, payload, tier]
+      properties:
+        provider:
+          type: string
+          description: The configured tool provider name that handled the call.
+        tool:
+          type: string
+          description: The tool name that was invoked.
+        payload:
+          type: object
+          additionalProperties: true
+          description: |
+            The raw JSON payload returned by the tool adapter. Schema is
+            tool-specific; callers must handle the shape for the named tool.
+        tier:
+          type: integer
+          enum: [1, 2, 3, 4, 5]
+          description: The egress tier at which the tool call was routed.
+
     GatewayError:
       type: object
       required: [error]
@@ -999,6 +1436,12 @@ components:
                 - not_found
                 - conflict
                 - internal_error
+                # Runtime provider-key management (Donna #7)
+                - failed_precondition
+                # Tool-call HTTP transport (WS3 / PR4a — ADR 0014)
+                - egress_refused
+                - unknown_provider
+                - tool_provider_unavailable
             message: {type: string}
             details: {type: object, additionalProperties: true}
 

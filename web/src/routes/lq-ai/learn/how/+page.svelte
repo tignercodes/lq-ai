@@ -1,11 +1,13 @@
 <!--
   /lq-ai/learn/how — "How It Works" visualization page.
 
-  Seven interactive playground iframes in narrative order: system map →
+  Sixteen interactive playground iframes in narrative order: system map →
   request lifecycle → tier system → skill composition → citation engine →
-  anonymization layer → data residency. Each section has: a heading, a
-  2-3 sentence framing paragraph, the embedded iframe, and an
-  "Open full-screen" link.
+  anonymization layer → data residency → playbook cascade → tabular review →
+  word add-in flow → observability trace → autonomous flow → autonomous
+  primitives → KB hybrid retrieval → projects/org tiers → intake bridges. Each
+  section has: a heading, a 2-3 sentence framing paragraph, the embedded iframe,
+  and an "Open full-screen" link.
 
   Iframes load the static HTML playgrounds at /learn/playgrounds/*.html
   served directly by the web container from web/static/learn/playgrounds/.
@@ -21,9 +23,10 @@
 		<a href="/lq-ai/learn" class="lq-back-link">← Learn</a>
 		<h1 class="lq-text-page-h">How It Works</h1>
 		<p class="lq-text-body lq-page-intro">
-			Seven interactive surfaces. Together they tell the story of how LQ.AI works from request to
-			response. Each playground links to the source files that implement what it shows — if a
-			visualization makes a claim, the linked file is where you verify it.
+			Sixteen interactive surfaces. Together they tell the story of how LQ.AI works from request to
+			response — the engine, its boundaries, the M3 capability surfaces built on top, and the
+			observability trace that ties them together. Each playground links to the source files that
+			implement what it shows — if a visualization makes a claim, the linked file is where you verify it.
 		</p>
 	</header>
 
@@ -341,7 +344,7 @@
 		<p class="lq-transition lq-text-body">
 			Understanding what the model receives answers the "what" — but procurement and security teams
 			also need to know where that data is stored and whether it ever leaves the operator's
-			environment. The final playground addresses that directly.
+			environment. The next playground addresses that directly.
 		</p>
 
 		<!-- 7: Data Residency -->
@@ -390,6 +393,429 @@
 				</span>
 			</div>
 		</section>
+		<p class="lq-transition lq-text-body">
+			The seven playgrounds above trace the engine and its boundaries. The final three demonstrate the
+			M3 capability surfaces — Playbooks, Tabular Review, and the Word add-in — built on that engine.
+		</p>
+
+		<!-- 8: Playbook execution cascade -->
+		<section class="lq-how-section" data-testid="lq-ai-learn-how-section-playbook-cascade">
+			<h2 class="lq-section-h">8. Reviewing a contract: the Playbook execution cascade</h2>
+			<p class="lq-text-body">
+				A Playbook codifies an organization's standard positions on common contract issues. Applying
+				one runs a four-node LangGraph cascade — retrieve → classify → redline → compile — that walks
+				each position, extracts the matching clause, classifies it against the standard, and drafts a
+				redline where it deviates. This playground steps through that cascade position-by-position
+				against synthetic NDAs. The per-position references are the verbatim matched clause text
+				(lexical FTS), not the M2 Citation Engine verification cascade — that integration is deferred.
+			</p>
+			<div class="lq-playground-wrap">
+				<iframe
+					src="/learn/playgrounds/playbook-cascade.html"
+					title="Playbook executor — 4-node cascade"
+					loading="lazy"
+					data-testid="learn-playground-playbook-cascade"
+					style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+				></iframe>
+			</div>
+			<div class="lq-playground-foot">
+				<a
+					href="/learn/playgrounds/playbook-cascade.html"
+					class="lq-link lq-fullscreen-link"
+					target="_blank"
+					rel="noopener noreferrer">Open full-screen ↗</a
+				>
+				<span class="lq-source-ref">
+					Source:
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/playbooks/nodes.py"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">api/app/playbooks/nodes.py</a
+					>;
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/docs/playbooks.md"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">docs/playbooks.md</a
+					>
+				</span>
+			</div>
+		</section>
+
+		<p class="lq-transition lq-text-body">
+			A Playbook reviews one contract against many positions. Tabular Review inverts that — many
+			contracts against a few questions, in a grid.
+		</p>
+
+		<!-- 9: Tabular Review grid -->
+		<section class="lq-how-section" data-testid="lq-ai-learn-how-section-tabular-review">
+			<h2 class="lq-section-h">9. Comparing many contracts: the Tabular Review grid</h2>
+			<p class="lq-text-body">
+				Tabular Review extracts the same set of questions across a set of documents and lays the
+				answers out in a grid — one row per document, one column per question. Each cell is grounded in
+				the chunks the model cited; click a cell to open its citation drawer. This playground renders a
+				small grid of synthetic NDAs; the citation drawer shows the same fields the real surface does.
+				Per-cell citations are display-only chunk references today (a synthetic citation id), not
+				Citation-Engine-resolved provenance.
+			</p>
+			<div class="lq-playground-wrap">
+				<iframe
+					src="/learn/playgrounds/tabular-review.html"
+					title="Tabular Review — grid + cell citation drawer"
+					loading="lazy"
+					data-testid="learn-playground-tabular-review"
+					style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+				></iframe>
+			</div>
+			<div class="lq-playground-foot">
+				<a
+					href="/learn/playgrounds/tabular-review.html"
+					class="lq-link lq-fullscreen-link"
+					target="_blank"
+					rel="noopener noreferrer">Open full-screen ↗</a
+				>
+				<span class="lq-source-ref">
+					Source:
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/tabular/nodes.py"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">api/app/tabular/nodes.py</a
+					>;
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/docs/tabular-review.md"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">docs/tabular-review.md</a
+					>
+				</span>
+			</div>
+		</section>
+
+		<p class="lq-transition lq-text-body">
+			Playbooks and Tabular Review run in the web app. The Word add-in brings the deployment into the
+			operator's editor — the last playground walks its install and auth flow.
+		</p>
+
+		<!-- 10: Word add-in install + auth flow -->
+		<section class="lq-how-section" data-testid="lq-ai-learn-how-section-word-addin-flow">
+			<h2 class="lq-section-h">10. Into the editor: the Word add-in install + auth flow</h2>
+			<p class="lq-text-body">
+				The Word add-in is an Office.js task pane installed against the operator's own deployment. This
+				playground walks the four-stage flow: admin generates a per-deployment manifest, the operator
+				sideloads the unsigned manifest via the Microsoft 365 Admin Center (which warns about the
+				unsigned add-in — expected at v0.3.0), the task pane completes OAuth against the deployment, and
+				the version handshake confirms compatibility. M3 shipped the plumbing only — the in-pane feature
+				surface (chat, skills, playbooks) is deferred (DE-287; M4 closed without it — community-friendly), and the signed distribution package is
+				community-led.
+			</p>
+			<div class="lq-playground-wrap">
+				<iframe
+					src="/learn/playgrounds/word-addin-flow.html"
+					title="Word Add-In — install + auth flow"
+					loading="lazy"
+					data-testid="learn-playground-word-addin-flow"
+					style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+				></iframe>
+			</div>
+			<div class="lq-playground-foot">
+				<a
+					href="/learn/playgrounds/word-addin-flow.html"
+					class="lq-link lq-fullscreen-link"
+					target="_blank"
+					rel="noopener noreferrer">Open full-screen ↗</a
+				>
+				<span class="lq-source-ref">
+					Source:
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/api/word_addin.py"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">api/app/api/word_addin.py</a
+					>;
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/docs/word-addin.md"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">docs/word-addin.md</a
+					>
+				</span>
+			</div>
+		</section>
+
+		<p class="lq-transition lq-text-body">
+			Every chat-send, playbook run, and tabular extraction emits a distributed trace. The final
+			playground makes the full span hierarchy visible — from the HTTP boundary at the api down
+			through inference dispatch, anonymization, and citation verification — so operators can answer
+			latency, cost, and data-handling questions from a single trace view.
+		</p>
+
+		<!-- 11: OTel trace visualizer -->
+		<section class="lq-how-section" data-testid="lq-ai-learn-how-section-otel-eval">
+			<h2 class="lq-section-h">11. Seeing it all at once: the observability trace</h2>
+			<p class="lq-text-body">
+				Every chat-send is one OpenTelemetry trace spanning api → gateway → provider, with domain
+				spans for citation verification, anonymization, skill dispatch, and inference carrying counts
+				and types only — never raw entity values, prompt text, or response content. This playground
+				lets you toggle the citation path, anonymization state, workflow type, and provider tier to
+				see how the span tree changes, and shows which span attribute answers each of the five
+				questions an operator is most likely to ask in production.
+			</p>
+			<div class="lq-playground-wrap">
+				<iframe
+					src="/learn/playgrounds/otel-eval.html"
+					title="OTel trace — chat-send end to end"
+					loading="lazy"
+					data-testid="learn-playground-otel-eval"
+					style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+				></iframe>
+			</div>
+			<div class="lq-playground-foot">
+				<a
+					href="/learn/playgrounds/otel-eval.html"
+					class="lq-link lq-fullscreen-link"
+					target="_blank"
+					rel="noopener noreferrer">Open full-screen ↗</a
+				>
+				<span class="lq-source-ref">
+					Source:
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/docs/observability.md"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">docs/observability.md</a
+					>;
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/observability_helpers.py"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">api/app/observability_helpers.py</a
+					>
+				</span>
+			</div>
+		</section>
+		<section class="lq-how-section" data-testid="lq-ai-learn-how-section-autonomous-flow">
+			<h2 class="lq-section-h">12. Autonomy you can audit: the Autonomous flow</h2>
+			<p class="lq-text-body">
+				The Autonomous Layer (M4, shipped) runs a single agent on your
+				behalf — on a schedule, or when documents arrive — without you watching each step. Because no
+				human approves each action, the agent runs through declared phases behind one brake-checked
+				chokepoint, and every run produces an auditable receipt. Step through a session below and trip
+				each brake yourself.
+			</p>
+			<div class="lq-playground-wrap">
+				<iframe
+					src="/learn/playgrounds/autonomous-flow.html"
+					title="Autonomous flow — a single agent, fully audited"
+					loading="lazy"
+					data-testid="learn-playground-autonomous-flow"
+					style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+				></iframe>
+			</div>
+			<div class="lq-playground-foot">
+				<a
+					href="/learn/playgrounds/autonomous-flow.html"
+					class="lq-link lq-fullscreen-link"
+					target="_blank"
+					rel="noopener noreferrer">Open full-screen ↗</a
+				>
+				<span class="lq-source-ref">
+					Source:
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/docs/LQVern/agentic-flow-alignment-guide.md"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">agentic-flow-alignment-guide.md</a
+					>;
+					<a
+						href="https://github.com/LegalQuants/lq-ai/blob/main/docs/adr/0013-autonomous-layer-design-influences.md"
+						class="lq-link"
+						target="_blank"
+						rel="noopener noreferrer">ADR 0013</a
+					>
+				</span>
+			</div>
+		</section>
+
+			<p class="lq-transition lq-text-body">
+				The flow above showed a single session start to finish. But what schedules those sessions, what feeds them documents, and what captures what they learn? The next playground breaks the Autonomous Layer into its four primitives.
+			</p>
+
+			<!-- 13: autonomous-primitives -->
+			<section class="lq-how-section" data-testid="lq-ai-learn-how-section-autonomous-primitives">
+				<h2 class="lq-section-h">13. The four autonomous primitives: watches, schedules, memory, precedent</h2>
+				<p class="lq-text-body">
+					An autonomous session does not run in isolation — it is wired to four primitives that decide when it runs and what it carries across runs. <strong>Watches</strong> trigger a session when matching documents arrive; <strong>schedules</strong> trigger it on a cron-like cadence; <strong>memory</strong> persists what a session learned so later runs build on it; and the <strong>precedent lifecycle</strong> promotes vetted work product into reusable precedent. This playground steps through each primitive and shows how it feeds the session you saw in playground 12. The Autonomous Layer shipped in M4.
+				</p>
+				<div class="lq-playground-wrap">
+					<iframe
+						src="/learn/playgrounds/autonomous-primitives.html"
+						title="Autonomous primitives — watches, schedules, memory, precedent"
+						loading="lazy"
+						data-testid="learn-playground-autonomous-primitives"
+						style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+					></iframe>
+				</div>
+				<div class="lq-playground-foot">
+					<a
+						href="/learn/playgrounds/autonomous-primitives.html"
+						class="lq-link lq-fullscreen-link"
+						target="_blank"
+						rel="noopener noreferrer">Open full-screen ↗</a
+					>
+					<span class="lq-source-ref">
+						Source:
+						<a
+							href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/api/autonomous.py"
+							class="lq-link"
+							target="_blank"
+							rel="noopener noreferrer">api/app/api/autonomous.py</a
+						>;
+						<a
+							href="https://github.com/LegalQuants/lq-ai/blob/main/docs/autonomous-layer.md"
+							class="lq-link"
+							target="_blank"
+							rel="noopener noreferrer">docs/autonomous-layer.md</a
+						>
+					</span>
+				</div>
+			</section>
+
+			<p class="lq-transition lq-text-body">
+				Every one of these surfaces — chat, playbooks, autonomous sessions — leans on the same retrieval foundation: finding the right knowledge-base chunks for a given query. The next playground opens up how that retrieval actually works.
+			</p>
+
+			<!-- 14: kb-hybrid-retrieval -->
+			<section class="lq-how-section" data-testid="lq-ai-learn-how-section-kb-hybrid-retrieval">
+				<h2 class="lq-section-h">14. Finding the right chunks: knowledge-base hybrid retrieval</h2>
+				<p class="lq-text-body">
+					When a message needs grounding context, LQ.AI does not rely on vector search alone. It runs <strong>hybrid retrieval</strong>: a lexical full-text-search pass (Postgres FTS) and a vector cosine-similarity pass run in parallel, and their results are fused into a single ranked set so that both exact-term matches and semantically-related passages surface. This playground lets you issue a query against synthetic KB chunks and watch the lexical scores, the vector scores, and the fused ranking that the engine ultimately uses. Knowledge-base retrieval shipped in M1.
+				</p>
+				<div class="lq-playground-wrap">
+					<iframe
+						src="/learn/playgrounds/kb-hybrid-retrieval.html"
+						title="Knowledge-base hybrid retrieval — lexical + vector, fused"
+						loading="lazy"
+						data-testid="learn-playground-kb-hybrid-retrieval"
+						style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+					></iframe>
+				</div>
+				<div class="lq-playground-foot">
+					<a
+						href="/learn/playgrounds/kb-hybrid-retrieval.html"
+						class="lq-link lq-fullscreen-link"
+						target="_blank"
+						rel="noopener noreferrer">Open full-screen ↗</a
+					>
+					<span class="lq-source-ref">
+						Source:
+						<a
+							href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/knowledge/retrieval.py"
+							class="lq-link"
+							target="_blank"
+							rel="noopener noreferrer">api/app/knowledge/retrieval.py</a
+						>;
+						<a
+							href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/api/knowledge_bases.py"
+							class="lq-link"
+							target="_blank"
+							rel="noopener noreferrer">api/app/api/knowledge_bases.py</a
+						>
+					</span>
+				</div>
+			</section>
+
+			<p class="lq-transition lq-text-body">
+				Retrieval finds the right chunks, but the chunks are only part of the context. A matter's organization profile, its attachments, and its privilege and tier settings all shape what a request is allowed to do. The next playground shows that context being assembled.
+			</p>
+
+			<!-- 15: projects-org-tiers -->
+			<section class="lq-how-section" data-testid="lq-ai-learn-how-section-projects-org-tiers">
+				<h2 class="lq-section-h">15. The matter's context: projects, org profile, and tier floors</h2>
+				<p class="lq-text-body">
+					Every request runs inside a matter (a project), and the matter carries the context that shapes it: the organization profile (the house voice and standard positions), the matter's attachments and knowledge bases, and its privilege flag and tier floor. This playground lets you configure a matter and watch how each of those settings flows into the assembled request — including how a privileged matter or a stricter tier floor narrows which providers the Gateway will permit. Projects, organization profiles, and tier floors shipped in M1.
+				</p>
+				<div class="lq-playground-wrap">
+					<iframe
+						src="/learn/playgrounds/projects-org-tiers.html"
+						title="Projects, org profile, and tier floors — shaping a request"
+						loading="lazy"
+						data-testid="learn-playground-projects-org-tiers"
+						style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+					></iframe>
+				</div>
+				<div class="lq-playground-foot">
+					<a
+						href="/learn/playgrounds/projects-org-tiers.html"
+						class="lq-link lq-fullscreen-link"
+						target="_blank"
+						rel="noopener noreferrer">Open full-screen ↗</a
+					>
+					<span class="lq-source-ref">
+						Source:
+						<a
+							href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/api/projects.py"
+							class="lq-link"
+							target="_blank"
+							rel="noopener noreferrer">api/app/api/projects.py</a
+						>;
+						<a
+							href="https://github.com/LegalQuants/lq-ai/blob/main/gateway/app/tier_floor.py"
+							class="lq-link"
+							target="_blank"
+							rel="noopener noreferrer">gateway/app/tier_floor.py</a
+						>
+					</span>
+				</div>
+			</section>
+
+			<p class="lq-transition lq-text-body">
+				Everything so far has been about work already inside LQ.AI. The last playground covers getting work in — the Slack and Teams intake bridges — and is honest about how much of it is verified today.
+			</p>
+
+			<!-- 16: intake-bridges -->
+			<section class="lq-how-section" data-testid="lq-ai-learn-how-section-intake-bridges">
+				<h2 class="lq-section-h">16. Getting work in: the Slack/Teams intake bridges</h2>
+				<p class="lq-text-body">
+					The intake bridges let an operator connect a Slack workspace or a Microsoft Teams tenant so that requests can flow into LQ.AI from where the business already works. This playground walks the OAuth install flow and the admin lifecycle (list, soft-delete) for a connected bridge.
+				</p>
+				<p class="lq-text-body" style="font-size: 13px; color: var(--lq-text-secondary);">
+					<strong>Honest partial state:</strong> the backend plumbing and admin lifecycle shipped in M3, but the live OAuth install handshake is unverified against real Slack and Teams tenants (<strong>DE-312</strong>), and the inbound <code>/lq</code> command path is inert — it does not yet dispatch a request (<strong>DE-288</strong>). Treat this surface as scaffolding, not a production-ready intake channel.
+				</p>
+				<div class="lq-playground-wrap">
+					<iframe
+						src="/learn/playgrounds/intake-bridges.html"
+						title="Slack/Teams intake bridges — OAuth install + admin lifecycle"
+						loading="lazy"
+						data-testid="learn-playground-intake-bridges"
+						style="width: 100%; height: 900px; border: 1px solid var(--lq-border, #e5e7eb); border-radius: 8px;"
+					></iframe>
+				</div>
+				<div class="lq-playground-foot">
+					<a
+						href="/learn/playgrounds/intake-bridges.html"
+						class="lq-link lq-fullscreen-link"
+						target="_blank"
+						rel="noopener noreferrer">Open full-screen ↗</a
+					>
+					<span class="lq-source-ref">
+						Source:
+						<a
+							href="https://github.com/LegalQuants/lq-ai/blob/main/docs/intake-bridges.md"
+							class="lq-link"
+							target="_blank"
+							rel="noopener noreferrer">docs/intake-bridges.md</a
+						>;
+						<a
+							href="https://github.com/LegalQuants/lq-ai/blob/main/api/app/api/admin_intake_bridges.py"
+							class="lq-link"
+							target="_blank"
+							rel="noopener noreferrer">api/app/api/admin_intake_bridges.py</a
+						>
+					</span>
+				</div>
+			</section>
 	</div>
 
 	<footer class="lq-how-footer">

@@ -12,10 +12,11 @@ clear the cache via `get_settings.cache_clear()` after monkeypatching env.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["debug", "info", "warning", "warn", "error", "critical"]
@@ -144,6 +145,32 @@ class Settings(BaseSettings):
         description="Shared secret for backend ↔ gateway. Required in prod.",
     )
 
+    # ----- Chat history (multi-turn memory) -----
+    # The chat send path (api/app/api/chats.py) replays prior turns of the
+    # conversation to the model so chat is genuinely multi-turn — previously
+    # only the current turn was sent. History is trimmed most-recent-first to
+    # fit BOTH a token budget and a hard message-count cap; oldest turns drop
+    # first when either is exceeded. Token counts use a cheap ~4-chars/token
+    # heuristic (no tokenizer dependency — CLAUDE.md SBOM posture). Operators
+    # on long-context models can raise the budget; set it to 0 to disable
+    # history replay entirely (revert to single-turn requests).
+    lq_ai_chat_history_token_budget: int = Field(
+        default=6_000,
+        ge=0,
+        description=(
+            "Approximate token budget (~4 chars/token) for prior chat turns "
+            "replayed to the model. 0 disables multi-turn history."
+        ),
+    )
+    lq_ai_chat_history_max_messages: int = Field(
+        default=20,
+        ge=0,
+        description=(
+            "Hard cap on the number of prior chat messages replayed to the "
+            "model, independent of the token budget. 0 disables history."
+        ),
+    )
+
     # ----- JWT (per ADR 0002 — backend owns auth) -----
     jwt_secret: str = Field(
         default="dev-jwt-secret-change-me",
@@ -181,6 +208,37 @@ class Settings(BaseSettings):
             "token resets the clock; the refresh endpoint 401s when "
             "exceeded. PRD §5.1 default: 30 minutes."
         ),
+    )
+
+    # ----- Autonomous (M4) -----
+    # Global fallback cap on per-session cost for autonomous sessions
+    # whose spawning trigger (watch or schedule) did not specify
+    # ``max_cost_usd``. Mirrors the gateway.yaml default. R4 (the
+    # economic brake) trips when projected cost would exceed this cap.
+    autonomous_default_max_cost_usd: Decimal = Field(
+        default=Decimal("5.00"),
+        description=(
+            "Global default per-session cost cap (USD) for autonomous sessions "
+            "spawned by a watch or schedule that did not set max_cost_usd. "
+            "Mirrors the gateway.yaml default. R4 (economic brake) trips when "
+            "projected cost would exceed this cap."
+        ),
+        validation_alias=AliasChoices("LQ_AI_AUTONOMOUS_DEFAULT_MAX_COST_USD"),
+    )
+
+    # Default model the analysis node passes to the gateway when neither
+    # the spawning trigger (watch/schedule ``params["model"]``) nor the
+    # target skill/playbook pinned one. Mirrors the gateway.yaml deployment
+    # default. Operators may override via the env var; the value must be a
+    # model identifier the gateway recognises in its routing table.
+    autonomous_default_model: str = Field(
+        default="claude-opus-4-7",
+        description=(
+            "Fallback chat-completion model used by the autonomous "
+            "analysis node when ``params['model']`` is not set on the "
+            "session. Must be a model id the gateway can route."
+        ),
+        validation_alias=AliasChoices("LQ_AI_AUTONOMOUS_DEFAULT_MODEL"),
     )
 
     # M-Sec.1 — MFA-mandatory deployment flag per PRD §5.1. When True,
@@ -286,11 +344,80 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ----- M3-D1 slack-bridge integration -----
+    # The slack-bridge runs the OAuth dance with Slack then POSTs the
+    # resulting workspace record to
+    # ``POST /api/v1/integrations/slack/workspaces``. Both secrets here
+    # live on the api ONLY (NOT on the gateway): the gateway has no
+    # role in the Slack OAuth surface, and keeping its secret surface
+    # minimal is a load-bearing posture. Different from the gateway's
+    # ``LQ_AI_GATEWAY_MASTER_KEY`` on purpose — Slack bot tokens enable
+    # bot impersonation; provider keys enable inference routing.
+    # Different blast radii → different keys.
+    lq_ai_bridge_token: str = Field(
+        default="",
+        description=(
+            "Shared bearer token the slack-bridge presents on POSTs to "
+            "/api/v1/integrations/slack/workspaces. Constant-time matched."
+        ),
+    )
+    lq_ai_bridge_master_key: str = Field(
+        default="",
+        description=(
+            "urlsafe-base64 Fernet master key used to encrypt Slack bot "
+            "tokens at rest (and any future bridge-issued secret)."
+        ),
+    )
+
     # ----- Operational -----
     log_level: LogLevel = Field(default="info", description="Log level for the api/ service.")
     lq_ai_dev_mode: bool = Field(
         default=False,
         description="When true, relax some safety checks for local development.",
+    )
+
+    # ----- SMTP / email transport (M4-C1) -----
+    # Optional best-effort email transport for autonomous notifications.
+    # Email is enabled IFF ``smtp_host`` is set; with it unset the notify
+    # handler's email step is a clean no-op (the durable in-app row is the
+    # record regardless). No new dependency — the sender uses stdlib
+    # ``smtplib`` run via ``asyncio.to_thread`` (CLAUDE.md SBOM posture).
+    smtp_host: str | None = Field(
+        default=None,
+        description=(
+            "SMTP server hostname for autonomous-notification email. "
+            "Unset disables email transport (in-app notifications still work)."
+        ),
+    )
+    smtp_port: int = Field(
+        default=587,
+        description="SMTP server port. Default 587 (STARTTLS submission).",
+    )
+    smtp_username: str | None = Field(
+        default=None,
+        description="SMTP auth username. Unset skips login (open relay / no auth).",
+    )
+    smtp_password: str | None = Field(
+        default=None,
+        description="SMTP auth password. Unset skips login.",
+    )
+    smtp_from: str | None = Field(
+        default=None,
+        description=(
+            "From address for notification email. Falls back to ``smtp_username`` when unset."
+        ),
+    )
+    smtp_use_tls: bool = Field(
+        default=True,
+        description="Issue STARTTLS after connecting. Default True.",
+    )
+    smtp_timeout: int = Field(
+        default=10,
+        description=(
+            "Socket timeout (seconds) for the SMTP connection — applies to "
+            "connect, STARTTLS, and send. Bounds the best-effort send so a "
+            "hung/black-holing mail server can't tie up a worker thread."
+        ),
     )
 
     # ----- CORS -----

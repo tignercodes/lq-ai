@@ -160,12 +160,83 @@
 			</div>
 		</section>
 
+		<!-- 3b: Dev-facing visualizations -->
+		<section class="lq-build-section" data-testid="lq-ai-learn-build-section-dev-viz">
+			<h2 class="lq-section-h">Before you open a PR: what must pass, and how to trace it</h2>
+			<p class="lq-text-body">
+				Two interactive maps help you ship a change that merges cleanly. The test landscape shows
+				every gate a PR must clear before merge — unit, integration, end-to-end, lint, type-check,
+				and coverage — and where each one lives. The observability trace shows the OpenTelemetry
+				span tree a single chat-send produces, so you can see exactly where to add instrumentation
+				for a new surface.
+			</p>
+			<div class="lq-build-links">
+				<a href="/learn/playgrounds/test-landscape.html" class="lq-link" target="_blank" rel="noopener noreferrer">Test landscape: what must pass before merge ↗</a>
+				<span class="lq-sep">·</span>
+				<a href="/learn/playgrounds/otel-eval.html" class="lq-link" target="_blank" rel="noopener noreferrer">Observability trace explorer ↗</a>
+				<span class="lq-sep">·</span>
+				<a href="https://github.com/LegalQuants/lq-ai/blob/main/docs/observability.md" class="lq-link" target="_blank" rel="noopener noreferrer">docs/observability.md</a>
+			</div>
+		</section>
+
+		<!-- 3c: Anatomy of an aligned agentic flow (M4) -->
+		<section class="lq-build-section" data-testid="lq-ai-learn-build-section-agentic-flow">
+			<h2 class="lq-section-h">Anatomy of an aligned agentic flow (M4)</h2>
+			<p class="lq-text-body">
+				<strong>Shipped in M4.</strong> When you contribute an autonomous flow — a single agent that
+				acts without a human approving each step — transparency moves from "you can read the prompt" to "you
+				can audit the behavior." Four obligations make a flow aligned. The authoritative how-to is the
+				<a href="https://github.com/LegalQuants/lq-ai/blob/main/docs/LQVern/agentic-flow-alignment-guide.md" class="lq-link" target="_blank" rel="noopener noreferrer">agentic-flow-alignment-guide.md</a>;
+				this is the condensed checklist.
+			</p>
+			<div class="lq-build-steps">
+				<div class="lq-build-step">
+					<span class="lq-build-step-n">1</span>
+					<div>
+						<strong>One chokepoint.</strong> Every tool call goes through the single
+						<code>guarded_tool_call</code> chokepoint — no tool bypasses it. A new tool gets the brakes
+						and telemetry for free and cannot route around them.
+					</div>
+				</div>
+				<div class="lq-build-step">
+					<span class="lq-build-step-n">2</span>
+					<div>
+						<strong>Brakes before the tool runs.</strong> R5 (halt-state read), R6 (phase-grant check),
+						and R4 (cost-cap projection) are all checked <em>before</em> the tool executes — in that order.
+					</div>
+				</div>
+				<div class="lq-build-step">
+					<span class="lq-build-step-n">3</span>
+					<div>
+						<strong>Observable + audited, counts only.</strong> Emit the <code>autonomous.execute</code>
+						+ <code>autonomous.tool_call</code> spans and closed-enum audit rows (phase_transition
+						/ tool_call / halted / cost_cap_reached / completed). Attributes carry counts, types, IDs, and
+						costs only — never raw entity values, document text, prompt bodies, or model responses.
+					</div>
+				</div>
+				<div class="lq-build-step">
+					<span class="lq-build-step-n">4</span>
+					<div>
+						<strong>A user-readable receipt.</strong> Every run produces a receipt that says what the agent
+						did and why — every tool call, the inputs seen (counts/types/IDs), cost, phase, and gates passed —
+						readable by the user, not just the operator.
+					</div>
+				</div>
+			</div>
+			<div class="lq-build-links">
+				<a href="https://github.com/LegalQuants/lq-ai/blob/main/docs/LQVern/agentic-flow-alignment-guide.md" class="lq-link" target="_blank" rel="noopener noreferrer">Building aligned agentic flows — the contributor guide ↗</a>
+				<span class="lq-sep">·</span>
+				<a href="/learn/playgrounds/autonomous-flow.html" class="lq-link" target="_blank" rel="noopener noreferrer">Autonomous flow playground ↗</a>
+			</div>
+		</section>
+
 		<!-- 4: Roadmap -->
 		<section class="lq-build-section" data-testid="lq-ai-learn-build-section-roadmap">
 			<h2 class="lq-section-h">The roadmap</h2>
 			<p class="lq-text-body">
-				LQ.AI follows a milestone-based roadmap. M1 ships the foundation. Each subsequent
-				milestone adds a named capability layer on top.
+				LQ.AI follows a milestone-based roadmap. M1 shipped the foundation; M2 and M3 each added a
+				named capability layer on top. M1, M2, M3, and the M4 Autonomous Layer are all shipped; the
+				Contract Relationship graph remains deferred future work.
 			</p>
 			<div class="lq-roadmap-list">
 				<div class="lq-roadmap-item lq-roadmap-item--shipped">
@@ -177,27 +248,33 @@
 						Three provider adapters: Anthropic, OpenAI, Ollama.
 					</div>
 				</div>
-				<div class="lq-roadmap-item">
-					<div class="lq-roadmap-pill lq-roadmap-pill--future">M2</div>
+				<div class="lq-roadmap-item lq-roadmap-item--shipped">
+					<div class="lq-roadmap-pill">M2</div>
 					<div>
-						<strong>Citation Engine + Anonymization Layer + Playbooks.</strong>
-						Character-level citation verification, personal-data pseudonymization
-						before inference, multi-step playbook execution. Vertex AI and AWS
-						Bedrock provider adapters.
+						<strong>Citation Engine + Anonymization Layer.</strong>
+						Character-level citation verification and personal-data pseudonymization
+						before inference, plus the Azure OpenAI provider adapter.
 					</div>
 				</div>
-				<div class="lq-roadmap-item">
-					<div class="lq-roadmap-pill lq-roadmap-pill--future">M3</div>
+				<div class="lq-roadmap-item lq-roadmap-item--shipped">
+					<div class="lq-roadmap-pill">M3</div>
 					<div>
-						<strong>Integrations.</strong> Microsoft Word add-in (Office.js), Slack/Teams
-						bridge, Tabular Review surface.
+						<strong>Capability surfaces + integrations.</strong> Playbooks, Tabular Review,
+						Slack/Teams intake bridges, OpenTelemetry observability, and the Microsoft Word
+						add-in (Office.js — plumbing only at v0.3.0; the in-pane feature surface is deferred).
 					</div>
 				</div>
-				<div class="lq-roadmap-item">
-					<div class="lq-roadmap-pill lq-roadmap-pill--future">M4</div>
+				<div class="lq-roadmap-item lq-roadmap-item--shipped">
+					<div class="lq-roadmap-pill">M4</div>
 					<div>
 						<strong>Autonomous Layer.</strong> Multi-step agent execution with
-						verifiable receipts; Contract Relationship graph.
+						verifiable receipts (opt-in, off by default).
+					</div>
+				</div>
+				<div class="lq-roadmap-item">
+					<div class="lq-roadmap-pill lq-roadmap-pill--future">Future</div>
+					<div>
+						<strong>Contract Relationship graph.</strong> Deferred future work — not yet built.
 					</div>
 				</div>
 			</div>

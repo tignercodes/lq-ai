@@ -1,13 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { TABS, isTabVisible, isTabAvailable, activeTabFor, type TabId, type User } from '../tabs';
+import { TABS, isTabVisible, isTabAvailable, activeTabFor, type TabId, type User, type TabVisibilityOpts } from '../tabs';
 
 describe('tabs', () => {
   const adminUser: User = { id: '1', email: 'a@x.io', is_admin: true, must_change_password: false, role: 'admin' };
   const memberUser: User = { id: '2', email: 'm@x.io', is_admin: false, must_change_password: false, role: 'member' };
 
-  it('defines seven core tabs plus admin (learn added in Wave C)', () => {
+  it('defines nine core tabs plus autonomous (opt-in) and admin (tabular added in M3-C3, autonomous added in M4-C2)', () => {
     const ids = TABS.map((t) => t.id);
-    expect(ids).toEqual(['home', 'chats', 'matters', 'skills', 'knowledge', 'saved-prompts', 'learn', 'admin']);
+    expect(ids).toEqual([
+      'home',
+      'chats',
+      'matters',
+      'skills',
+      'knowledge',
+      'playbooks',
+      'tabular',
+      'saved-prompts',
+      'learn',
+      'autonomous',
+      'admin'
+    ]);
   });
 
   it('hides admin tab for non-admin users', () => {
@@ -15,11 +27,41 @@ describe('tabs', () => {
     expect(isTabVisible('admin', adminUser)).toBe(true);
   });
 
+  // Autonomous tab — opt-in gated (M4-C2)
+  it('hides autonomous tab when autonomousEnabled is false', () => {
+    expect(isTabVisible('autonomous', memberUser, { autonomousEnabled: false })).toBe(false);
+  });
+  it('shows autonomous tab when autonomousEnabled is true', () => {
+    expect(isTabVisible('autonomous', memberUser, { autonomousEnabled: true })).toBe(true);
+  });
+  it('hides autonomous tab when no opts provided (defaults to off)', () => {
+    expect(isTabVisible('autonomous', memberUser)).toBe(false);
+  });
+
   it('shows core tabs to all users', () => {
-    for (const id of ['home', 'chats', 'matters', 'skills', 'knowledge', 'saved-prompts'] as TabId[]) {
+    for (const id of [
+      'home',
+      'chats',
+      'matters',
+      'skills',
+      'knowledge',
+      'playbooks',
+      'tabular',
+      'saved-prompts'
+    ] as TabId[]) {
       expect(isTabVisible(id, memberUser)).toBe(true);
       expect(isTabVisible(id, adminUser)).toBe(true);
     }
+  });
+
+  it('marks tabular tab as available (M3-C3)', () => {
+    expect(isTabAvailable('tabular')).toBe(true);
+  });
+
+  it('activeTabFor recognises /lq-ai/tabular subroutes', () => {
+    expect(activeTabFor('/lq-ai/tabular')).toBe('tabular');
+    expect(activeTabFor('/lq-ai/tabular/new')).toBe('tabular');
+    expect(activeTabFor('/lq-ai/tabular/abc-123')).toBe('tabular');
   });
 
   it('marks every M1 tab as available (last placeholder closed)', () => {
@@ -35,6 +77,8 @@ describe('tabs', () => {
     expect(isTabAvailable('knowledge')).toBe(true);
     // Learn surface landed in Wave C alongside Knowledge.
     expect(isTabAvailable('learn')).toBe(true);
+    // Playbooks surface landed in M3-A4.
+    expect(isTabAvailable('playbooks')).toBe(true);
   });
 
   it('derives active tab from pathname', () => {

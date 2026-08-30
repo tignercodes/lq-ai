@@ -60,6 +60,10 @@ tags:
     description: Audit log query (admin only)
   - name: tier-policy
     description: Inference tier policy configuration (admin only)
+  - name: word-addin
+    description: Word add-in unauthenticated handshake surfaces (M3-B8)
+  - name: autonomous
+    description: Per-user autonomous agent session management — read, halt (M4-A4-i)
 
 # ============================================================
 # PATHS
@@ -262,6 +266,36 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/User'
+    patch:
+      tags: [users]
+      summary: Update the caller's own profile (display_name)
+      description: |
+        Bearer-authenticated. Caller-scoped — updates only the
+        authenticated user's own row; no user id is accepted from the
+        path or body. Currently edits `display_name` only: the value is
+        trimmed, must be non-empty after trimming, and is length-capped
+        (200 chars). Omitting `display_name` (or sending an empty body)
+        is a 422 — there is nothing to update. Writes a
+        `user.profile_updated` audit row listing the changed fields and
+        returns the updated `User` (same shape as `GET /users/me`).
+
+        Email self-service editing is intentionally out of scope on this
+        surface — changing the login email pulls in re-verification, MFA,
+        and uniqueness concerns and warrants its own dedicated flow (a
+        future enhancement).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UserProfileUpdate'}
+      responses:
+        '200':
+          description: Updated user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '422': {description: Validation error (empty/whitespace/over-length display_name, or no fields to update)}
 
   /api/v1/users/me/export:
     post:
@@ -1622,10 +1656,16 @@ paths:
                         created: {type: integer}
                         owned_by: {type: string}
                         lq_ai_kind: {type: string, enum: [alias, provider_native]}
+                        # routed_inference_tier is present on provider_native rows AND on
+                        # alias rows (the tier of the alias's primary resolution).
                         routed_inference_tier: {type: integer, enum: [1, 2, 3, 4, 5]}
                         provider_type:
                           type: string
                           enum: [anthropic, openai, vertex, cohere, azure_openai, bedrock, ollama, vllm, openai_compatible]
+                        # alias rows only (absent on provider_native):
+                        lq_ai_resolves_to: {type: string}
+                        # alias rows, present only when > 0 (absent otherwise / on provider_native):
+                        lq_ai_fallback_count: {type: integer}
         '401':
           description: Missing or invalid bearer token
           content:
@@ -2339,6 +2379,611 @@ paths:
                   next_cursor: {type: string, nullable: true}
 
   # ----------- ADMIN: MODEL ALIAS CRUD (D0.5) -----------
+  /api/v1/playbooks:
+    get:
+      tags: [playbooks]
+      summary: List playbooks visible to the caller (M3-A4)
+      description: |
+        Returns playbooks the caller can see: admins see all;
+        non-admins see playbooks they authored or built-in playbooks
+        (``created_by IS NULL``). Soft-deleted rows (``deleted_at IS NOT
+        NULL``) are excluded for everyone, including admins. Positions
+        are NOT inlined; clients call ``GET /api/v1/playbooks/{id}`` to
+        fetch them.
+      responses:
+        '200':
+          description: List of playbooks (positions empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Playbook'
+        '401':
+          description: Not authenticated.
+    post:
+      tags: [playbooks]
+      summary: Create a new playbook (M3-A6)
+      description: |
+        Creates a playbook owned by the caller (``created_by =
+        caller.id``). Admins do not get to mint built-ins through this
+        endpoint — built-ins (``created_by IS NULL``) ship via seed
+        migration only. The Inference-Tier and audit posture matches
+        other write endpoints on the API.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PlaybookCreate'}
+      responses:
+        '201':
+          description: Playbook created. Body includes the assembled positions.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Playbook'}
+        '401':
+          description: Not authenticated.
+        '422':
+          description: Validation error (e.g., unknown field, invalid severity enum).
+
+  /api/v1/playbooks/{playbook_id}:
+    parameters:
+      - in: path
+        name: playbook_id
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      tags: [playbooks]
+      summary: Get a playbook with its full position list (M3-A4)
+      description: |
+        Returns the playbook header + positions + fallback tiers.
+        Visibility matches ``GET /api/v1/playbooks``. 404 (not 403)
+        on unauthorized access, including for soft-deleted rows.
+      responses:
+        '200':
+          description: Full playbook with positions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Playbook'
+        '404':
+          description: Playbook not found, or caller is not authorized to see it.
+        '401':
+          description: Not authenticated.
+    patch:
+      tags: [playbooks]
+      summary: Update a playbook header; optionally replace positions (M3-A6)
+      description: |
+        Patches the playbook. Authorization:
+
+        * Built-in playbooks (``created_by IS NULL``) are 403 to
+          everyone, including admins — operators fork-then-edit. This
+          keeps shared deployment-level content immutable to a single
+          operator's mistake.
+        * Non-built-in playbooks can be patched by the playbook's author
+          OR by an admin. Cross-user / soft-deleted cases return 404.
+
+        Position replacement is atomic: when ``positions`` is supplied,
+        every existing position row for this playbook is deleted and
+        the new list is inserted in a single transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PlaybookUpdate'}
+      responses:
+        '200':
+          description: Playbook updated; response is the fresh full shape.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Playbook'}
+        '403':
+          description: Built-in playbooks cannot be edited through this endpoint.
+        '404':
+          description: Playbook not found, soft-deleted, or not authorized.
+        '401':
+          description: Not authenticated.
+        '422':
+          description: Validation error.
+    delete:
+      tags: [playbooks]
+      summary: Soft-delete a playbook (M3-A6)
+      description: |
+        Sets ``deleted_at`` on the row. The ``playbook_positions`` rows
+        remain so historical executions still resolve their position
+        references. Authorization mirrors PATCH: built-ins are 403;
+        non-built-ins require admin OR ownership; cross-user / already-
+        deleted is 404. Subsequent reads (GET, list) treat the row as
+        absent.
+      responses:
+        '204':
+          description: Playbook soft-deleted.
+        '403':
+          description: Built-in playbooks cannot be deleted through this endpoint.
+        '404':
+          description: Playbook not found, already soft-deleted, or not authorized.
+        '401':
+          description: Not authenticated.
+
+  /api/v1/playbooks/easy:
+    post:
+      tags: [playbooks]
+      summary: Start an Easy Playbook generation run (M3-A6)
+      description: |
+        Kicks off the Easy Playbook auto-generation pipeline against
+        the supplied document corpus. Creates an
+        ``EasyPlaybookGeneration`` row at ``status='pending'`` and
+        enqueues the ARQ worker job on the ``arq:m3a6`` queue (the
+        dedicated M3-A6 worker — see ``app/workers/arq_setup.py``).
+        Returns 202 immediately; the wizard's Step 2 polls
+        ``GET /api/v1/playbooks/easy/{generation_id}`` until status
+        reaches a terminal value.
+
+        Authorization: caller must own every document in
+        ``document_ids`` (admins bypass). Cross-user / missing /
+        soft-deleted documents collapse into 404.
+
+        Generation completion does NOT mean the playbook is fit for
+        use; the wizard's Step 3 inline editor is where the user-
+        attorney validates and edits before the final save (which
+        POSTs to ``/api/v1/playbooks`` like any other playbook).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EasyPlaybookGenerationCreate'}
+      responses:
+        '202':
+          description: Generation scheduled; row created at status `pending`.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EasyPlaybookGeneration'}
+        '404':
+          description: One or more documents not found / not authorized.
+        '422':
+          description: Validation error (empty ``document_ids``, unknown field, etc.).
+        '401':
+          description: Not authenticated.
+
+  /api/v1/playbooks/easy/{generation_id}:
+    parameters:
+      - in: path
+        name: generation_id
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      tags: [playbooks]
+      summary: Poll an Easy Playbook generation row (M3-A6)
+      description: |
+        Returns the current state of one Easy Playbook generation.
+        Caller must be the row's user OR an admin; cross-user / missing
+        rows return 404.
+
+        When ``status='completed'``, ``draft_playbook`` carries the
+        assembled ``PlaybookCreate`` shape — the wizard's Step 3 inline
+        editor binds to this. When ``status='error'``, ``error_message``
+        is populated. The wizard's Step 2 polls every few seconds until
+        a terminal status arrives.
+      responses:
+        '200':
+          description: Current generation row.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EasyPlaybookGeneration'}
+        '404':
+          description: Generation not found or not authorized.
+        '401':
+          description: Not authenticated.
+
+  # M3-C2 — Tabular / Multi-Document Review surface (PRD §3.14).
+  /api/v1/tabular/preview-cost:
+    post:
+      tags: [tabular]
+      summary: Preview the cost of a proposed tabular execution (M3-C2)
+      description: |
+        Synchronous cost preview — no execution row is created. The UI
+        calls this before showing the confirmation modal so the
+        operator sees the cell-count + estimated cost + per-tier
+        breakdown (Phase C prep doc Decision C-5).
+
+        Either ``skill_name`` or ``columns`` is required (not both).
+        The estimator uses a rolling-average over recent
+        ``purpose='tabular_extraction'`` routing-log rows; cold-start
+        deployments see the conservative default per-cell cost until
+        enough calibration data accumulates.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TabularPreviewCostRequest'}
+      responses:
+        '200':
+          description: Cost preview.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TabularPreviewCostResponse'}
+        '400':
+          description: Both ``skill_name`` and ``columns`` provided, or skill has no columns.
+        '404':
+          description: ``skill_name`` not found in the live skill registry.
+        '422':
+          description: Validation error (empty ``document_ids``, malformed column spec, etc.).
+        '401':
+          description: Not authenticated.
+
+  /api/v1/tabular/execute:
+    post:
+      tags: [tabular]
+      summary: Start a tabular execution (M3-C2)
+      description: |
+        Kicks off a tabular execution against the supplied document
+        corpus. Creates a ``TabularExecution`` row at
+        ``status='pending'`` and enqueues the ARQ worker job on the
+        shared playbook queue (per Decision C-3 — same queue as Easy
+        Playbook). Returns 202 immediately; the result view polls
+        ``GET /api/v1/tabular/executions/{id}`` until status reaches
+        a terminal value.
+
+        Authorization: caller must own every document in
+        ``document_ids`` (admins bypass). Cross-user / missing /
+        soft-deleted documents collapse into 404.
+
+        Execution completion does NOT mean every cell is correct —
+        the result view's per-cell citation drawer is where the
+        user-attorney validates extractions before relying on them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TabularExecutionCreate'}
+      responses:
+        '202':
+          description: Execution scheduled; row created at status `pending`.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TabularExecution'}
+        '400':
+          description: Both ``skill_name`` and ``columns`` provided, or skill has no columns.
+        '404':
+          description: One or more documents not found / not authorized, or skill not found.
+        '422':
+          description: Validation error.
+        '401':
+          description: Not authenticated.
+
+  /api/v1/tabular/executions:
+    get:
+      tags: [tabular]
+      summary: List the caller's tabular executions (M3-C2)
+      description: |
+        Returns the caller's tabular executions in recent-first order.
+        Soft-deleted rows are excluded. Admins see all rows; non-admins
+        see only their own.
+      parameters:
+        - in: query
+          name: limit
+          schema: {type: integer, default: 50, minimum: 1, maximum: 200}
+          description: Maximum rows to return; default 50.
+      responses:
+        '200':
+          description: List of tabular execution summaries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/TabularExecutionSummary'}
+        '401':
+          description: Not authenticated.
+
+  /api/v1/tabular/executions/{execution_id}:
+    parameters:
+      - in: path
+        name: execution_id
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      tags: [tabular]
+      summary: Get a tabular execution by id (M3-C2)
+      description: |
+        Returns the full execution — status, results grid, costs,
+        timing. Caller must be the row's user OR an admin; cross-user
+        / missing / soft-deleted rows return 404.
+      responses:
+        '200':
+          description: Current execution row.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TabularExecution'}
+        '404':
+          description: Execution not found or not authorized.
+        '401':
+          description: Not authenticated.
+    delete:
+      tags: [tabular]
+      summary: Soft-delete a tabular execution (M3-C2)
+      description: |
+        Sets ``deleted_at`` to now. Soft-deleted rows are invisible
+        to list / get / cancel endpoints; subsequent operations
+        return 404.
+      responses:
+        '204':
+          description: Soft-deleted.
+        '404':
+          description: Execution not found or already deleted.
+        '401':
+          description: Not authenticated.
+
+  /api/v1/tabular/executions/{execution_id}/cancel:
+    parameters:
+      - in: path
+        name: execution_id
+        required: true
+        schema: {type: string, format: uuid}
+    post:
+      tags: [tabular]
+      summary: Cancel a pending or running tabular execution (M3-C2)
+      description: |
+        Sets status to ``cancelled`` and ``completed_at`` to now.
+        The worker's per-cell loop checks the row status at each
+        cell-iteration boundary; on cancellation it stops accepting
+        new cells and the aggregate node writes whatever partial
+        results landed. Terminal rows (``completed`` / ``failed`` /
+        ``cancelled``) return 409 — operators wanting a clean re-run
+        start a new execution via ``POST /tabular/execute``.
+      responses:
+        '200':
+          description: Cancellation accepted; row updated.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TabularExecution'}
+        '404':
+          description: Execution not found or not authorized.
+        '409':
+          description: Execution already in a terminal status.
+        '401':
+          description: Not authenticated.
+
+  /api/v1/tabular/executions/{execution_id}/export:
+    parameters:
+      - in: path
+        name: execution_id
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      tags: [tabular]
+      summary: Export a completed tabular grid as XLSX or CSV (M3-C4a)
+      description: |
+        Streams the tabular grid in the requested format. Both formats
+        carry the document column (leftmost) plus one column per declared
+        column spec, in spec order. Cells with ``confidence='failed'``
+        render as ``"(failed)"`` so operators can spot gaps.
+
+        Citation surfacing differs by format:
+
+        * **XLSX** — each grid cell with at least one citation carries an
+          openpyxl cell ``Comment`` listing the citation ids + confidences
+          (up to 5 per comment; the cell retains the full count). Operators
+          hover any cell in Excel / Numbers / Google Sheets to see sources.
+        * **CSV** — a trailing ``citation_links`` column per row carries a
+          semicolon-separated list of ``"<column_name>:<citation_id>"``
+          pairs across the row's cells; empty when no cell had citations.
+
+        The execution must be in ``status='completed'`` — pending /
+        running / cancelled / failed rows return 409 (partial grids would
+        mislead downstream consumers).
+      parameters:
+        - in: query
+          name: format
+          required: false
+          schema: {type: string, enum: [xlsx, csv], default: xlsx}
+          description: Export format. `xlsx` carries citations as cell comments; `csv` flattens them into a `citation_links` column.
+      responses:
+        '200':
+          description: Streaming export; `Content-Type` matches the format.
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema: {type: string, format: binary}
+            text/csv:
+              schema: {type: string, format: binary}
+        '404':
+          description: Execution not found or not authorized.
+        '409':
+          description: Execution not in a terminal `completed` status — cannot export.
+        '401':
+          description: Not authenticated.
+
+  /api/v1/playbooks/{playbook_id}/execute:
+    parameters:
+      - in: path
+        name: playbook_id
+        required: true
+        schema: {type: string, format: uuid}
+    post:
+      tags: [playbooks]
+      summary: Kick off a playbook execution against a target document (M3-A2)
+      description: |
+        Creates a new ``playbook_executions`` row at status ``'pending'``
+        and schedules the four-node LangGraph workflow
+        (retrieve → classify → redline → compile) as a FastAPI
+        BackgroundTask. The response returns immediately (202) with the
+        new row; clients poll
+        ``GET /api/v1/playbook-executions/{execution_id}`` until they
+        see a terminal status (``completed`` or ``error``).
+
+        Authorization: caller must be an admin or the playbook's
+        author, and own the target document's parent file. If
+        ``project_id`` is supplied, caller must also own the project.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_document_id]
+              additionalProperties: false
+              properties:
+                target_document_id:
+                  type: string
+                  format: uuid
+                project_id:
+                  type: string
+                  format: uuid
+                  nullable: true
+      responses:
+        '202':
+          description: Execution scheduled; row created at status `pending`.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlaybookExecution'}
+        '401':
+          description: Not authenticated.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Playbook, target document, or project not found / not owned.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '422':
+          description: Request body validation error (e.g., missing or malformed `target_document_id`, unknown field).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/playbook-executions/{execution_id}:
+    parameters:
+      - in: path
+        name: execution_id
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      tags: [playbooks]
+      summary: Poll the current state of a playbook execution (M3-A2)
+      description: |
+        Returns the row regardless of completion state. Callers poll
+        until they see a terminal ``completed`` or ``error`` status.
+        Authorization: caller must own the execution (``user_id``
+        match) or be an admin.
+      responses:
+        '200':
+          description: Current execution state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlaybookExecution'}
+        '401':
+          description: Not authenticated.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Execution not found or caller does not own it.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/admin/ingest-health:
+    get:
+      tags: [admin]
+      summary: Aggregate ingest-status counts across the deployment (admin-only)
+      description: |
+        Reports document-level + file-level ingest health in a single
+        response: ``ok`` (chunks embedded), ``embed_failed`` /
+        ``partial`` (document-level post-parse failures introduced by
+        M3-0.3 / DE-276), and ``parse_failed`` (file-level parse
+        failures from the M1 pipeline). Soft-deleted rows are excluded.
+
+        A non-zero ``embed_failed`` or ``partial`` count is the
+        operator's canonical signal that hybrid retrieval has silently
+        degraded for some documents — the exact failure mode DE-276
+        was filed to surface. A non-zero ``parse_failed`` count means
+        operators should inspect the file-list UI for the specific
+        failures.
+      responses:
+        '200':
+          description: Aggregate ingest-health summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, embed_failed, partial, parse_failed, total_documents]
+                properties:
+                  ok:
+                    type: integer
+                    description: Documents with all chunks successfully embedded.
+                  embed_failed:
+                    type: integer
+                    description: |
+                      Documents whose embed worker raised before any chunk
+                      was embedded — hybrid retrieval falls back to FTS-only.
+                  partial:
+                    type: integer
+                    description: |
+                      Documents whose embed worker raised mid-batch — some
+                      chunks have vectors, others are NULL.
+                  parse_failed:
+                    type: integer
+                    description: |
+                      Files that failed at parse time and never produced a
+                      ``documents`` row (``files.ingestion_status='failed'``).
+                  total_documents:
+                    type: integer
+                    description: Sum of ok + embed_failed + partial.
+                example:
+                  ok: 124
+                  embed_failed: 0
+                  partial: 1
+                  parse_failed: 2
+                  total_documents: 125
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/admin/bootstrap-status:
+    get:
+      tags: [admin]
+      summary: Report whether the first-run bootstrap admin password is still active
+      description: |
+        **Unauthenticated.** Consulted by the login UI before the operator
+        has credentials, so it can render a fresh-install hint pointing at
+        the API container logs when the bootstrap password has not yet
+        been rotated (M3-0.1 / DE-283).
+
+        ``default_password_active`` is True when at least one non-deleted
+        admin user still has ``must_change_password=True``. The flag flips
+        to False once the operator hits ``POST /api/v1/auth/change-password``,
+        at which point the login UI stops surfacing the hint.
+
+        The signal exposed by this endpoint is low-sensitivity: the
+        bootstrap password is 24 characters of CSPRNG output, so knowing
+        a deployment is in fresh-install state does not measurably help
+        an attacker who lacks the log line.
+      responses:
+        '200':
+          description: Bootstrap state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [default_password_active, logs_hint]
+                properties:
+                  default_password_active:
+                    type: boolean
+                    description: |
+                      True when at least one admin user is still in the
+                      ``must_change_password=True`` state, indicating the
+                      first-run bootstrap password has not been rotated.
+                  logs_hint:
+                    type: string
+                    description: |
+                      Shell command an operator can run to retrieve the
+                      bootstrap password from the API container's logs.
+                example:
+                  default_password_active: true
+                  logs_hint: 'docker compose logs api 2>&1 | grep "First-run admin password"'
+
   /api/v1/admin/aliases:
     get:
       tags: [admin]
@@ -2432,6 +3077,133 @@ paths:
           description: Alias removed
         '404':
           description: Alias not configured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/admin/provider-keys:
+    get:
+      tags: [admin]
+      summary: List provider-key status (admin only)
+      description: |
+        Donna #7 (runtime BYOK). Proxies the gateway's
+        ``/admin/v1/provider-keys`` surface. The backend holds the
+        gateway-key; the frontend never does. Returns a secret-safe status
+        row per configured provider — the response NEVER contains a full
+        key, only the last 4 characters of a resolved key. The caller's
+        bearer token must have ``is_admin = true`` or the endpoint returns
+        403 ``forbidden``.
+      responses:
+        '200':
+          description: Provider-key status list
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderKeyList'}
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+    post:
+      tags: [admin]
+      summary: Set/replace a provider's runtime key (admin only)
+      description: |
+        Proxies the gateway's set-key path. The gateway encrypts the
+        plaintext key, persists it to gateway.yaml, and hot-applies the
+        rebuilt adapter — no restart. The backend forwards the JSON and
+        never returns the secret. 400 when the gateway master key is unset
+        (surfaced as ``validation_error``); 404 when the provider isn't a
+        configured entry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProviderKeySetRequest'}
+      responses:
+        '200':
+          description: Key applied; provider status returned (no secret)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderKeyStatus'}
+        '400':
+          description: Gateway master key is not set
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Provider not configured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/admin/provider-keys/{provider}:
+    parameters:
+      - in: path
+        name: provider
+        required: true
+        schema: {type: string}
+    patch:
+      tags: [admin]
+      summary: Rotate a provider's runtime key (admin only)
+      description: |
+        Same mechanics as POST /api/v1/admin/provider-keys; the provider
+        comes from the path. Proxies the gateway, which retires the
+        displaced adapter and swaps the rebuilt one in. The backend never
+        returns the secret. 400 when the gateway master key is unset; 404
+        when the provider isn't configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProviderKeyRotateRequest'}
+      responses:
+        '200':
+          description: Key rotated; provider status returned (no secret)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderKeyStatus'}
+        '400':
+          description: Gateway master key is not set
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Provider not configured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+    delete:
+      tags: [admin]
+      summary: Revoke a provider's runtime key (admin only)
+      description: |
+        Proxies the gateway's revoke path. Only runtime
+        (encrypted-at-rest) keys can be revoked; an env-sourced key is
+        owned by the operator's environment and returns 409.
+      responses:
+        '204':
+          description: Runtime key revoked
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Provider not configured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: Provider has no runtime key to revoke (e.g., env-sourced)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -2612,6 +3384,107 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UsageResponse'}
+
+  # ----------- WORD ADD-IN (M3-B1) -----------
+  /api/v1/admin/word-addin/manifest:
+    get:
+      tags: [admin]
+      summary: Render the Word add-in manifest XML for sideload (M3-B1)
+      description: |
+        Admin-only. Renders the Office Add-in XML manifest with the
+        operator's deployment URL + a freshly generated GUID substituted
+        into the template. Operators use the rendered file to sideload
+        the add-in via Microsoft 365 Admin Center.
+
+        Origin resolution order:
+        1. ``deployment_origin`` query param when supplied
+        2. ``X-Forwarded-Proto`` + ``X-Forwarded-Host`` headers (the
+           operator's reverse-proxy reports these)
+        3. The request URL's scheme + host (single-process dev fallback)
+
+        Per PRD §9 DE-287, the Word add-in's user-facing feature tabs
+        (chat / skills / playbook execution / Inference Tier badge) are
+        descoped to M4 / community contribution; this M3-B1 endpoint
+        ships the install-and-authenticate plumbing.
+      parameters:
+        - name: deployment_origin
+          in: query
+          required: false
+          description: |
+            Override the deployment origin embedded in the manifest.
+            Defaults to the request's effective origin (reverse-proxy
+            aware). No trailing slash.
+          schema: {type: string, format: uri, example: 'https://lq.acme.example'}
+        - name: display_name
+          in: query
+          required: false
+          description: |
+            Branded name surfaced inside Word's ribbon and the task
+            pane GetStarted message.
+          schema: {type: string, maxLength: 64, default: 'LQ.AI'}
+        - name: provider_name
+          in: query
+          required: false
+          description: |
+            ProviderName value the manifest surfaces to Microsoft 365
+            Admin Center; typically the operator org's name.
+          schema: {type: string, maxLength: 64, default: 'LegalQuants'}
+      responses:
+        '200':
+          description: Rendered Office Add-in XML manifest
+          headers:
+            Content-Disposition:
+              schema: {type: string, example: 'attachment; filename="lq-ai-word-addin-manifest.xml"'}
+              description: Tells the browser to download the manifest as a file.
+          content:
+            application/xml:
+              schema: {type: string, format: byte}
+        '401':
+          description: Unauthenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Caller is not an admin user
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/word-addin/version:
+    get:
+      tags: [word-addin]
+      summary: Word add-in version handshake (M3-B8)
+      description: |
+        **Unauthenticated.** The Word add-in's task pane calls this on
+        mount, BEFORE the user has signed in, so an out-of-date add-in
+        can surface an "Update needed" overlay rather than getting
+        stuck at a broken OAuth handshake or a breaking-change API
+        call.
+
+        Response payload:
+        - `deployment_version` — the LQ.AI api package version (the
+          deployment's release number). Informational; the add-in
+          surfaces it in the "Update needed" overlay so a user can
+          quote it to support.
+        - `addin_min_compatible_version` / `addin_max_compatible_version`
+          — the semver range of add-in bundles this deployment can
+          talk to. The task pane refuses to render features outside
+          the range.
+        - `taskpane_bundle_url` — canonical URL of the task pane HTML
+          entry. The task pane already knows this from `window.location`
+          today; the field exists in the handshake so a future
+          deployment can serve the bundle from a CDN or operator-chosen
+          path without changing the manifest.
+        - `taskpane_bundle_hash` — optional SHA-256 of the deployed
+          bundle JS. M3-B8 ships this nullable; M3-B7 signing CI
+          populates the value from the build manifest. Null means
+          "don't enforce" — not an error.
+      responses:
+        '200':
+          description: Version handshake payload
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WordAddinVersionResponse'}
 
   # ----------- INFERENCE (PRD §3.13 — Wave B) -----------
   /api/v1/inference/current-tier:
@@ -2803,6 +3676,1644 @@ paths:
         '404':
           description: Chat not found
 
+  # ============================================================
+  # M3-D1 — slack-bridge persistence surface
+  # ============================================================
+
+  /api/v1/integrations/slack/workspaces:
+    post:
+      tags: [integrations-slack]
+      summary: Persist a Slack workspace from the slack-bridge OAuth flow (M3-D1)
+      description: |
+        Service-to-service endpoint. Authenticated by a shared
+        `Authorization: Bearer ${LQ_AI_BRIDGE_TOKEN}` token (NOT a user
+        JWT) — the slack-bridge is the only intended caller.
+
+        The bridge POSTs the workspace tuple after the operator
+        completes the Slack OAuth install flow at
+        `${LQ_AI_BRIDGE_PUBLIC_URL}/slack/oauth/install`. The api
+        encrypts the bot token at rest under `LQ_AI_BRIDGE_MASTER_KEY`
+        (a separate Fernet master key from the gateway's
+        `LQ_AI_GATEWAY_MASTER_KEY` — different threat models) and
+        upserts on `team_id` so a re-install (Slack rotates bot tokens
+        on re-install) replaces the old ciphertext + scope + installer
+        in place. Soft-deleted rows revive on re-install.
+
+        500 (not 401) is the response when the operator hasn't set
+        `LQ_AI_BRIDGE_TOKEN` on the api — accepting bridge traffic
+        with no enforced secret would silently break the trust
+        contract.
+      security:
+        - bridgeBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SlackWorkspaceCreate'
+      responses:
+        '201':
+          description: Persisted (or upserted) the workspace record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SlackWorkspaceResponse'
+        '401':
+          description: Missing, malformed, or non-matching bridge bearer token
+        '500':
+          description: Operator has not configured `LQ_AI_BRIDGE_TOKEN` on the api
+
+  /api/v1/integrations/teams/tenants:
+    post:
+      tags: [integrations-teams]
+      summary: Persist a Microsoft 365 tenant from the teams-bridge OAuth flow (M3-D3)
+      description: |
+        Service-to-service endpoint. Authenticated by the **same**
+        `Authorization: Bearer ${LQ_AI_BRIDGE_TOKEN}` bearer as the
+        slack-bridge endpoint per M3-D3 decision #2 — one shared
+        secret authenticates every bridge → api call.
+
+        Unlike the Slack equivalent, no bot token is persisted here:
+        Microsoft Teams uses operator-supplied APP-LEVEL bot
+        credentials (one `MICROSOFT_APP_ID` per deployment) not
+        per-tenant tokens. The persisted record carries only the
+        tenant id + display name + installer object id.
+
+        Upserts on `tenant_id`. Soft-deleted rows revive on
+        re-install. `installed_at` is NOT moved by upsert (operators
+        can infer re-install activity from other field changes).
+      security:
+        - bridgeBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TeamsTenantCreate'
+      responses:
+        '201':
+          description: Persisted (or upserted) the tenant record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TeamsTenantResponse'
+        '401':
+          description: Missing, malformed, or non-matching bridge bearer token
+        '500':
+          description: Operator has not configured `LQ_AI_BRIDGE_TOKEN` on the api
+
+  # ============================================================
+  # M3-D4 — admin intake-bridges surface
+  # ============================================================
+
+  /api/v1/admin/intake-bridges:
+    get:
+      tags: [admin-intake-bridges]
+      summary: List live Slack + Teams installs for the admin UI (M3-D4)
+      description: |
+        Returns non-soft-deleted Slack workspaces and Teams tenants,
+        sorted by `installed_at DESC` within each section. Admin-only.
+        Backs the SvelteKit admin page at `/lq-ai/admin/intake-bridges`.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Live install list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntakeBridgesList'
+        '401':
+          description: Not authenticated
+        '403':
+          description: Authenticated but not an admin
+
+  /api/v1/admin/intake-bridges/slack/{workspace_id}:
+    delete:
+      tags: [admin-intake-bridges]
+      summary: Soft-delete a Slack workspace install (M3-D4)
+      description: |
+        Sets `deleted_at` to now. The row stays in the DB so a
+        re-install via the slack-bridge OAuth flow revives it in
+        place per the M3-D1 upsert semantics; the install history
+        is preserved across disconnect/reconnect cycles.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204':
+          description: Soft-deleted
+        '401':
+          description: Not authenticated
+        '403':
+          description: Authenticated but not an admin
+        '404':
+          description: Workspace not found or already disconnected
+
+  /api/v1/admin/intake-bridges/teams/{tenant_id}:
+    delete:
+      tags: [admin-intake-bridges]
+      summary: Soft-delete a Microsoft 365 tenant install (M3-D4)
+      description: |
+        Same posture as the Slack endpoint above — soft-delete with
+        revivable row.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tenant_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204':
+          description: Soft-deleted
+        '401':
+          description: Not authenticated
+        '403':
+          description: Authenticated but not an admin
+        '404':
+          description: Tenant not found or already disconnected
+
+# ============================================================
+# M4-A4-i — Autonomous sessions read/halt API
+# ============================================================
+
+  /api/v1/autonomous/sessions:
+    get:
+      tags: [autonomous]
+      summary: List the calling user's autonomous sessions (newest first, paginated)
+      description: |
+        Returns the caller's sessions ordered by ``created_at DESC``.
+        ``limit`` is clamped to [1, 200]; ``offset`` to [0, ∞).
+        Only the caller's own sessions are returned — cross-user isolation
+        is enforced at the query level.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, default: 50, minimum: 1, maximum: 200}
+          description: Maximum number of sessions to return (clamped to [1, 200]).
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, default: 0, minimum: 0}
+          description: Zero-based index of the first result to return.
+      responses:
+        '200':
+          description: Paginated list of autonomous sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousSessionListResponse'
+        '401':
+          description: Not authenticated
+
+  /api/v1/autonomous/sessions/{session_id}:
+    get:
+      tags: [autonomous]
+      summary: Fetch a single autonomous session with its full receipt
+      description: |
+        Returns the session plus a live-reconstructed receipt built from
+        audit rows (works for running and completed sessions).  A completed
+        session also has the receipt persisted in ``result``.
+
+        Another user's ``session_id`` returns 404 (not 403) to avoid
+        existence disclosure.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Session detail with receipt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousSessionDetailResponse'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Session not found
+
+  /api/v1/autonomous/sessions/{session_id}/findings:
+    get:
+      tags: [autonomous]
+      summary: List a session's persisted findings (work-product, stable order)
+      description: |
+        Returns the run's persisted findings (the ``emit_finding`` chokepoint
+        work-product) ordered by ``created_at ASC, id ASC``. Rows a run
+        emits in its single executor commit typically share one
+        ``created_at`` (transaction-stable ``now()``), so ``id`` is the
+        deterministic tiebreaker that keeps pagination stable — a
+        repeatable order, not a guaranteed emission sequence. This differs
+        intentionally from the newest-first autonomous lists: these are one
+        run's output.
+
+        Owner-gated by loading the owned session first (the findings table
+        has no ``user_id`` — authz is via the parent session). Another
+        user's ``session_id`` — or a missing one — returns 404 (not 403) to
+        avoid existence disclosure. ``limit`` is clamped to [1, 200];
+        ``offset`` to [0, ∞).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, default: 50, minimum: 1, maximum: 200}
+          description: Maximum number of findings to return (clamped to [1, 200]).
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, default: 0, minimum: 0}
+          description: Zero-based index of the first result to return.
+      responses:
+        '200':
+          description: Paginated list of the session's findings (stable created_at, id order)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousFindingListResponse'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Session not found
+
+  /api/v1/autonomous/sessions/{session_id}/artifacts:
+    get:
+      tags: [autonomous]
+      summary: List a session's persisted document-grade artifacts (work-product, stable order)
+      description: |
+        Returns the run's persisted artifact references (the
+        ``emit_artifact`` chokepoint work-product — markdown memos an
+        opted-in run saved into its target knowledge base as real
+        documents) ordered by ``created_at ASC, id ASC`` — one run's rows
+        typically share ``created_at`` (transaction-stable ``now()``), so
+        ``id`` is the deterministic tiebreaker that keeps pagination
+        stable; a repeatable order, not a guaranteed emission sequence.
+        Mirrors the findings read above.
+
+        Owner-gated by loading the owned session first (the artifacts
+        table has no ``user_id`` — authz is via the parent session).
+        Another user's ``session_id`` — or a missing one — returns 404
+        (not 403) to avoid existence disclosure. ``limit`` is clamped to
+        [1, 200]; ``offset`` to [0, ∞).
+
+        ``document_id`` is enriched at read time via the unique
+        ``documents.file_id``. Deletion semantics: a hard file-delete
+        SET-NULLs ``file_id`` (name/size metadata survives; both refs
+        return null); deleting the session removes these reference rows
+        but never the KB document — the document outlives the session.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, default: 50, minimum: 1, maximum: 200}
+          description: Maximum number of artifacts to return (clamped to [1, 200]).
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, default: 0, minimum: 0}
+          description: Zero-based index of the first result to return.
+      responses:
+        '200':
+          description: Paginated list of the session's artifact references (stable created_at, id order)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousArtifactListResponse'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Session not found
+
+  /api/v1/autonomous/sessions/{session_id}/halt:
+    post:
+      tags: [autonomous]
+      summary: Request an immediate halt for an autonomous session (idempotent)
+      description: |
+        Sets ``halt_state = 'halt_requested'`` so the executor's R5 temporal
+        brake trips on the next tool call and transitions the session to
+        ``halted``.
+
+        **Idempotent:** if ``halt_state`` is already ``halt_requested`` or
+        ``halted``, the endpoint returns the current session state with 200
+        and writes no duplicate audit row.
+
+        Another user's ``session_id`` returns 404 (not 403).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: false
+      responses:
+        '200':
+          description: Updated session (halt requested or already halted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousSessionRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Session not found
+
+  # M4-B1 — per-user memory curation API
+
+  /api/v1/autonomous/memory:
+    get:
+      tags: [autonomous]
+      summary: List the calling user's autonomous memory entries (non-deleted, newest first)
+      description: |
+        Returns the caller's non-deleted memory entries ordered by
+        ``created_at DESC``.  Pass ``?state=proposed|kept|dismissed`` to
+        filter by review state; omitting ``state`` returns all non-deleted
+        entries.  ``limit`` is clamped to [1, 200]; ``offset`` to [0, ∞).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [proposed, kept, dismissed]
+          description: Filter by review state; omit to return all non-deleted entries.
+        - name: source_session_id
+          in: query
+          required: false
+          schema: {type: string, format: uuid}
+          description: Narrow to the memories a specific run proposed; omit for all.
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, default: 50, minimum: 1, maximum: 200}
+          description: Maximum number of entries to return (clamped to [1, 200]).
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, default: 0, minimum: 0}
+          description: Zero-based index of the first result to return.
+      responses:
+        '200':
+          description: Paginated list of autonomous memory entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousMemoryListResponse'
+        '401':
+          description: Not authenticated
+
+  /api/v1/autonomous/memory/{memory_id}/keep:
+    post:
+      tags: [autonomous]
+      summary: Keep (approve) an autonomous memory entry; optional edit-on-keep
+      description: |
+        Transitions ``proposed`` or ``dismissed`` → ``kept``.  If the
+        optional body supplies ``content``, the entry's text is overwritten
+        (edit-on-keep).
+
+        **Re-keep semantics:** if the entry is already ``kept``, the action
+        is allowed — content is updated if provided; ``kept_at`` is
+        preserved.
+
+        Another user's ``memory_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: memory_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryKeepRequest'
+      responses:
+        '200':
+          description: Updated memory entry (now kept)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousMemoryRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Memory entry not found
+
+  /api/v1/autonomous/memory/{memory_id}/dismiss:
+    post:
+      tags: [autonomous]
+      summary: Dismiss an autonomous memory entry
+      description: |
+        Transitions ``proposed`` or ``kept`` → ``dismissed``.
+
+        Another user's ``memory_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: memory_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Updated memory entry (now dismissed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousMemoryRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Memory entry not found
+
+  /api/v1/autonomous/memory/{memory_id}:
+    delete:
+      tags: [autonomous]
+      summary: Soft-delete an autonomous memory entry (returns 200 with updated entry)
+      description: |
+        Soft-deletes the entry by setting ``deleted_at=now(UTC)``.
+        Returns **200** with the updated (deleted) entry — not 204 — to
+        avoid the FastAPI JSONResponse/204 assertion pitfall.
+
+        A subsequent GET excludes the entry; keep/dismiss/delete on a
+        deleted entry return 404.
+
+        Another user's ``memory_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: memory_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Soft-deleted memory entry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousMemoryRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Memory entry not found
+
+  # ── M4-B2 — precedent board + promote-to-Project proposal lifecycle ──
+
+  /api/v1/autonomous/precedents:
+    get:
+      tags: [autonomous]
+      summary: List the calling user's precedent entries (non-dismissed, newest first)
+      description: |
+        Returns the caller's non-dismissed precedent entries
+        (``dismissed_at IS NULL``) ordered by ``created_at DESC``.  Pass
+        ``?pattern_kind=`` to filter to one classifier; omitting it returns
+        all non-dismissed entries.  ``limit`` is clamped to [1, 200];
+        ``offset`` to [0, ∞).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: pattern_kind
+          in: query
+          required: false
+          schema: {type: string}
+          description: Filter by precedent classifier; omit to return all non-dismissed entries.
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, default: 50, minimum: 1, maximum: 200}
+          description: Maximum number of entries to return (clamped to [1, 200]).
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, default: 0, minimum: 0}
+          description: Zero-based index of the first result to return.
+      responses:
+        '200':
+          description: Paginated list of precedent entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrecedentEntryListResponse'
+        '401':
+          description: Not authenticated
+
+  /api/v1/autonomous/precedents/{precedent_id}/dismiss:
+    post:
+      tags: [autonomous]
+      summary: Dismiss a precedent entry (idempotent)
+      description: |
+        Sets ``dismissed_at=now(UTC)`` so the entry drops out of the board.
+        Re-dismissing leaves the original ``dismissed_at`` untouched.
+
+        Another user's ``precedent_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: precedent_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Updated precedent entry (now dismissed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrecedentEntryRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Precedent entry not found
+
+  /api/v1/autonomous/precedents/{precedent_id}/promote:
+    post:
+      tags: [autonomous]
+      summary: Propose promoting a precedent into a Project's context (proposal only)
+      description: |
+        Creates a ``proposed`` project-context proposal linking the
+        precedent to ``project_id``.  The ``suggested_md`` snippet is
+        derived server-side from the precedent's ``summary``.
+
+        This endpoint does **NOT** mutate ``projects.context_md`` —
+        promotion is a proposal only; the user accepting it performs the
+        authorized write (ADR 0013 D5).
+
+        Another user's ``precedent_id`` — or a ``project_id`` the caller
+        does not own — returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: precedent_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotePrecedentRequest'
+      responses:
+        '201':
+          description: Proposal created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectContextProposalRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Precedent or target project not found
+
+  /api/v1/autonomous/project-context-proposals:
+    get:
+      tags: [autonomous]
+      summary: List the calling user's project-context proposals (newest first)
+      description: |
+        Returns the caller's project-context proposals ordered by
+        ``created_at DESC``.  Pass ``?state=proposed|accepted|rejected``
+        and/or ``?project_id=`` to filter.  ``limit`` is clamped to
+        [1, 200]; ``offset`` to [0, ∞).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [proposed, accepted, rejected]
+          description: Filter by proposal state.
+        - name: project_id
+          in: query
+          required: false
+          schema: {type: string, format: uuid}
+          description: Filter to proposals targeting one Project.
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, default: 50, minimum: 1, maximum: 200}
+          description: Maximum number of proposals to return (clamped to [1, 200]).
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, default: 0, minimum: 0}
+          description: Zero-based index of the first result to return.
+      responses:
+        '200':
+          description: Paginated list of project-context proposals
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectContextProposalListResponse'
+        '401':
+          description: Not authenticated
+
+  /api/v1/autonomous/project-context-proposals/{proposal_id}/accept:
+    post:
+      tags: [autonomous]
+      summary: Accept a proposal — append the suggested context to the Project (user-authorized write)
+      description: |
+        The user-authorized write (ADR 0013 D5): appends the proposal's
+        ``suggested_md`` to the target Project's ``context_md``
+        (initializing it if NULL), sets ``state='accepted'`` and
+        ``accepted_at``.
+
+        Idempotent on re-accept: if already ``accepted``, returns the
+        current state without re-appending.  A ``rejected`` proposal may be
+        accepted (rejected→accepted) and the append occurs.
+
+        Another user's ``proposal_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: proposal_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Updated proposal (now accepted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectContextProposalRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Proposal not found
+
+  /api/v1/autonomous/project-context-proposals/{proposal_id}/reject:
+    post:
+      tags: [autonomous]
+      summary: Reject a proposal (does not touch Project context)
+      description: |
+        Sets ``state='rejected'`` and ``rejected_at``.  Does NOT touch
+        ``projects.context_md``.
+
+        Another user's ``proposal_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: proposal_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Updated proposal (now rejected)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectContextProposalRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Proposal not found
+
+  # ------------------------------------------------------------
+  # M4-B3 — Scheduled autonomous tasks
+  # ------------------------------------------------------------
+  /api/v1/autonomous/schedules:
+    post:
+      tags: [autonomous]
+      summary: Create an autonomous schedule (cron-triggered run definition)
+      description: |
+        Validates ``cron_expr`` (a five-field cron string); invalid
+        expressions return 422.  Seeds ``next_run_at`` from the cron
+        expression so the dispatcher can pick it up.  Per-user isolated.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutonomousScheduleCreate'
+      responses:
+        '201':
+          description: Schedule created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousScheduleRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Referenced project not found
+        '422':
+          description: Invalid cron expression
+    get:
+      tags: [autonomous]
+      summary: List the calling user's autonomous schedules (non-deleted, newest first)
+      description: |
+        Returns the caller's non-deleted schedules ordered by
+        ``created_at DESC``.  Optional ``?enabled=`` filter.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: enabled
+          in: query
+          required: false
+          schema: {type: boolean}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        '200':
+          description: Paginated list of schedules
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousScheduleListResponse'
+        '401':
+          description: Not authenticated
+
+  /api/v1/autonomous/schedules/{schedule_id}:
+    patch:
+      tags: [autonomous]
+      summary: Partially update an autonomous schedule (edit / enable / disable)
+      description: |
+        Partial update.  If ``cron_expr`` changes it is re-validated (422
+        on invalid) and ``next_run_at`` is recomputed.  Another user's
+        ``schedule_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: schedule_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutonomousScheduleUpdate'
+      responses:
+        '200':
+          description: Updated schedule
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousScheduleRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Schedule or referenced project not found
+        '422':
+          description: Invalid cron expression
+    delete:
+      tags: [autonomous]
+      summary: Soft-delete an autonomous schedule (returns 200 with updated entity)
+      description: |
+        Soft-deletes by setting ``deleted_at``.  Returns 200 with the
+        updated entity (NOT 204 — FastAPI JSONResponse/204 pitfall).
+        A deleted schedule is excluded from list and the dispatcher;
+        re-delete returns 404.  Another user's ``schedule_id`` returns 404.
+        Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: schedule_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Updated schedule (now soft-deleted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousScheduleRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Schedule not found
+
+  /api/v1/autonomous/watches:
+    post:
+      tags: [autonomous]
+      summary: Create an autonomous watch (KB-arrival-triggered run definition)
+      description: |
+        Creates a watch on a knowledge base the caller owns; document
+        arrivals (KB attach) then spawn an autonomous session. The caller
+        must own the target ``knowledge_base_id`` — a KB they cannot see
+        returns 404 (KB-sharing is out of scope). Per-user isolated.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutonomousWatchCreate'
+      responses:
+        '201':
+          description: Watch created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousWatchRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Target knowledge base or referenced project not found
+    get:
+      tags: [autonomous]
+      summary: List the calling user's autonomous watches (non-deleted, newest first)
+      description: |
+        Returns the caller's non-deleted watches ordered by
+        ``created_at DESC``.  Optional ``?enabled=`` and
+        ``?knowledge_base_id=`` filters.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: enabled
+          in: query
+          required: false
+          schema: {type: boolean}
+        - name: knowledge_base_id
+          in: query
+          required: false
+          schema: {type: string, format: uuid}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        '200':
+          description: Paginated list of watches
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousWatchListResponse'
+        '401':
+          description: Not authenticated
+
+  /api/v1/autonomous/watches/{watch_id}:
+    patch:
+      tags: [autonomous]
+      summary: Partially update an autonomous watch (enable / disable / retarget)
+      description: |
+        Partial update of ``enabled`` / ``playbook_id`` / ``skill_ref``.
+        The watch's ``knowledge_base_id`` is immutable. Another user's
+        ``watch_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: watch_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutonomousWatchUpdate'
+      responses:
+        '200':
+          description: Updated watch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousWatchRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Watch or referenced project not found
+    delete:
+      tags: [autonomous]
+      summary: Soft-delete an autonomous watch (returns 200 with updated entity)
+      description: |
+        Soft-deletes by setting ``deleted_at``.  Returns 200 with the
+        updated entity (NOT 204 — FastAPI JSONResponse/204 pitfall).
+        A deleted watch is excluded from list and the KB-arrival trigger;
+        re-delete returns 404.  Another user's ``watch_id`` returns 404.
+        Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: watch_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Updated watch (now soft-deleted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousWatchRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Watch not found
+
+  /api/v1/autonomous/notifications:
+    get:
+      tags: [autonomous]
+      summary: List the calling user's autonomous notifications (newest first)
+      description: |
+        Returns the caller's notifications ordered by ``created_at DESC``.
+        Pass ``?unread=true`` to narrow to unread rows (``read_at IS
+        NULL``). Per-user isolated.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: unread
+          in: query
+          required: false
+          schema: {type: boolean}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: offset
+          in: query
+          required: false
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        '200':
+          description: Paginated list of notifications
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousNotificationListResponse'
+        '401':
+          description: Not authenticated
+
+  /api/v1/autonomous/notifications/{notification_id}/read:
+    post:
+      tags: [autonomous]
+      summary: Mark an autonomous notification read (the dismiss action; idempotent)
+      description: |
+        Sets ``read_at`` if currently NULL; idempotent (re-read preserves
+        the original timestamp). "Read" IS the dismiss action — a read
+        notification drops out of ``?unread=true``. Another user's
+        ``notification_id`` returns 404.  Audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: notification_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Updated notification (now read)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousNotificationRead'
+        '401':
+          description: Not authenticated
+        '404':
+          description: Notification not found
+
+  /api/v1/autonomous/run-now:
+    post:
+      tags: [autonomous]
+      summary: Run a skill or playbook once now (one-off manual autonomous session)
+      description: |
+        Spawns a single ``trigger_kind='manual'`` autonomous session so a
+        user can test what a skill/playbook does — and inspect the
+        resulting receipt — before arming it as a schedule or watch.
+        Exactly one of ``playbook_id`` / ``skill_ref`` must be set (zero
+        or both → 422). ``target_kb_id`` / ``project_id`` are optional
+        scope; ``max_cost_usd`` is the per-run cap (NULL falls back to the
+        config default so R4 always arms). Gated by opt-in
+        (``autonomous_enabled``); the spawned session runs under the same
+        R4/R5/R6 brakes as every other session. Per-user isolated. Audited.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutonomousManualRunRequest'
+      responses:
+        '201':
+          description: Session spawned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutonomousSessionRead'
+        '401':
+          description: Not authenticated
+        '403':
+          description: Autonomous layer not enabled for this user
+        '404':
+          description: Referenced project not found
+        '422':
+          description: Invalid target (need exactly one of playbook_id/skill_ref)
+
+  /api/v1/research/capabilities:
+    get:
+      tags: [research]
+      summary: Report whether case-law research is enabled on this server
+      description: |
+        WS3b. Returns a positive "research enabled?" signal derived from the
+        gateway's sanitised config.  ``enabled`` is ``true`` when at least one
+        ``courtlistener`` tool-provider is declared in ``gateway.yaml``;
+        ``false`` otherwise.  The UI uses this to render a calm "not configured"
+        gate rather than treating an absent CourtListener as an outage.
+        Requires an authenticated user (bearer token).
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Research capability status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [enabled, providers]
+                properties:
+                  enabled:
+                    type: boolean
+                  providers:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, type]
+                      properties:
+                        name: {type: string}
+                        type: {type: string}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/research/verify-citations:
+    post:
+      tags: [research]
+      summary: Verify citations found in a text block
+      description: |
+        WS3b. Passes the supplied text to the CourtListener gateway tool
+        ``verify_citations`` and returns the per-citation verification
+        results (HTTP status, matching cluster ids). Stateless — no DB
+        write. Requires an authenticated user (bearer token).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 64000
+      responses:
+        '200':
+          description: Citation verification results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  citations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        citation: {type: string, nullable: true}
+                        normalized_citations:
+                          type: array
+                          items: {type: string}
+                        status: {type: integer, nullable: true}
+                        error_message: {type: string, nullable: true}
+                        clusters:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id: {type: integer, nullable: true}
+                              case_name: {type: string, nullable: true}
+                              absolute_url: {type: string, nullable: true}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/research/search:
+    post:
+      tags: [research]
+      summary: Search case law via CourtListener
+      description: |
+        WS3b. Proxies a full-text case-law search to the CourtListener
+        gateway tool ``search_case_law``. Returns a paginated result set
+        with case metadata. Stateless — no DB write. Requires an
+        authenticated user (bearer token).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [q]
+              properties:
+                q:
+                  type: string
+                  minLength: 1
+                court:
+                  type: string
+                  nullable: true
+                order_by:
+                  type: string
+                  nullable: true
+                cursor:
+                  type: string
+                  nullable: true
+                  description: "Opaque pagination cursor from a prior response's next_cursor; fetch the next page."
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                    nullable: true
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  next_cursor:
+                    type: string
+                    nullable: true
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/research/clusters/{cluster_id}:
+    get:
+      tags: [research]
+      summary: Fetch and cache a CourtListener opinion cluster
+      description: |
+        WS3b. Read-through cache: if the cluster is already in the DB
+        the cached metadata is returned immediately; otherwise the
+        gateway tool ``get_cases`` is called, the opinion plaintext is
+        stored in object storage, and the metadata is persisted in the
+        DB. Requires an authenticated user (bearer token).
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: cluster_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Cluster metadata with opinion list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cluster, opinions]
+                properties:
+                  cluster:
+                    type: object
+                    required: [cluster_id]
+                    properties:
+                      cluster_id: {type: integer}
+                      case_name: {type: string, nullable: true}
+                      court: {type: string, nullable: true}
+                      date_filed: {type: string, nullable: true}
+                      absolute_url: {type: string, nullable: true}
+                  opinions:
+                    type: array
+                    items:
+                      type: object
+                      required: [opinion_id, char_length]
+                      properties:
+                        opinion_id: {type: integer}
+                        text_field_used:
+                          type: string
+                          nullable: true
+                          enum: [html_with_citations, html_columbia, html_lawbox, xml_harvard, html_anon_2020, html, plain_text]
+                        char_length: {type: integer}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/research/opinions/{opinion_id}:
+    get:
+      tags: [research]
+      summary: Read cached opinion plaintext
+      description: |
+        WS3b. Returns the full plaintext of a previously fetched opinion
+        from object storage. Returns 404 if the cluster containing this
+        opinion was never fetched (call
+        ``GET /api/v1/research/clusters/{cluster_id}`` first). Requires
+        an authenticated user (bearer token).
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: opinion_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Opinion plaintext
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [opinion_id, cluster_id, text]
+                properties:
+                  opinion_id: {type: integer}
+                  cluster_id: {type: integer}
+                  text_field_used:
+                    type: string
+                    nullable: true
+                    enum: [html_with_citations, html_columbia, html_lawbox, xml_harvard, html_anon_2020, html, plain_text]
+                  text: {type: string}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Opinion not yet fetched; call GET /clusters/{id} first
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/research/find-in-case:
+    post:
+      tags: [research]
+      summary: Find keyword matches within a cached opinion
+      description: |
+        WS3b. Performs a case-insensitive substring search over the
+        cached plaintext of ``opinion_id``, returning up to
+        ``max_matches`` snippets with character positions. Returns 404
+        if the opinion was never fetched. Requires an authenticated
+        user (bearer token).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [opinion_id, query]
+              properties:
+                opinion_id:
+                  type: integer
+                query:
+                  type: string
+                  minLength: 1
+                max_matches:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                  default: 3
+      responses:
+        '200':
+          description: Match snippets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [opinion_id, matches]
+                properties:
+                  opinion_id: {type: integer}
+                  matches:
+                    type: array
+                    items:
+                      type: object
+                      required: [position, snippet]
+                      properties:
+                        position: {type: integer}
+                        snippet: {type: string}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Opinion not yet fetched; call GET /clusters/{id} first
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  # WS2/PR4b — MCP registry admin surface
+  /api/v1/admin/mcp:
+    get:
+      tags: [admin]
+      summary: List configured MCP servers and their cached tools (admin only)
+      description: |
+        WS2/PR4b. Returns the operator's configured MCP servers (sourced
+        from gateway config, type==mcp) together with each server's
+        discovery-cached tools and their ``enabled`` toggle state. The
+        caller's bearer token must have ``is_admin = true`` or the
+        endpoint returns 403 ``forbidden``.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: MCP servers with cached tools
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MCPServersResponse'}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/admin/mcp/{server}/refresh:
+    parameters:
+      - name: server
+        in: path
+        required: true
+        schema: {type: string}
+        description: MCP server name (as returned by the gateway config).
+    post:
+      tags: [admin]
+      summary: Re-discover and reconcile a server's tools (admin only)
+      description: |
+        WS2/PR4b. Triggers a fresh tool-discovery pass against the named
+        MCP server through the gateway (PR4a's GET /v1/tools/{provider}).
+        The discovery cache is reconciled: new tools are inserted with
+        ``enabled=true``; surviving tools preserve their existing
+        ``enabled`` flag; stale tools (no longer returned) are removed.
+        Writes a ``mcp.tools_refreshed`` audit row. 403 when the caller
+        is not an admin.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Refresh complete; returns the updated tool list
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MCPRefreshResponse'}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/admin/mcp/{server}/tools/{tool}:
+    parameters:
+      - name: server
+        in: path
+        required: true
+        schema: {type: string}
+        description: MCP server name.
+      - name: tool
+        in: path
+        required: true
+        schema: {type: string}
+        description: Tool name within the server's discovery cache.
+    patch:
+      tags: [admin]
+      summary: Enable or disable a cached MCP tool (admin only)
+      description: |
+        WS2/PR4b. Toggles the ``enabled`` flag on a single cached tool.
+        Disabled tools are not exposed to the model in the chat tool-loop
+        (PR5). 404 when the tool is not in the discovery cache (run
+        ``POST .../refresh`` first). Writes a ``mcp.tool_enabled`` audit
+        row when enabling, ``mcp.tool_disabled`` when disabling. 403 when
+        the caller is not an admin.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MCPToolEnableRequest'}
+      responses:
+        '200':
+          description: Tool updated; returns the updated tool view
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MCPToolView'}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Tool not in discovery cache
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  # PR4c — per-user MCP OAuth surface
+  /api/v1/mcp/oauth/{server}/authorize:
+    parameters:
+      - name: server
+        in: path
+        required: true
+        schema: {type: string}
+        description: MCP server name (as returned by the gateway config).
+    get:
+      tags: [mcp-oauth]
+      summary: Start the per-user OAuth flow for an MCP server
+      description: |
+        PR4c. ActiveUser-gated (bearer). Mints PKCE state, persists a
+        single-use mcp_oauth_state row, and returns a 302 redirect to the
+        authorization server's authorize endpoint. The callback URL is
+        wired to GET /api/v1/mcp/oauth/{server}/callback.
+      security:
+        - bearerAuth: []
+      responses:
+        '302':
+          description: Redirect to the authorization server authorize endpoint
+          headers:
+            Location:
+              schema: {type: string}
+              description: Authorization server authorize URL with PKCE parameters.
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Server is not a configured OAuth MCP provider
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/mcp/oauth/{server}/callback:
+    parameters:
+      - name: server
+        in: path
+        required: true
+        schema: {type: string}
+        description: MCP server name.
+    get:
+      tags: [mcp-oauth]
+      summary: OAuth callback — receive the authorization code from the AS
+      description: |
+        PR4c. PUBLIC (no bearer auth). The browser is redirected here by
+        the authorization server after the user grants consent. The caller
+        is identified via the single-use, TTL-bounded mcp_oauth_state row
+        (``state`` IS the binding). On success, tokens are encrypted and
+        stored and a mcp.oauth_connected audit row is written. Returns 200
+        with the connection summary.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: {type: string}
+          description: Authorization code issued by the AS.
+        - name: state
+          in: query
+          required: true
+          schema: {type: string}
+          description: Opaque state value echoed from the authorize request.
+        - name: iss
+          in: query
+          required: false
+          schema: {type: string}
+          description: Issuer identifier (RFC 9207); required when the AS advertised support.
+      responses:
+        '200':
+          description: OAuth flow completed; tokens stored
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MCPOAuthCallbackResponse'}
+        '400':
+          description: Unknown, expired, or replayed state; iss validation failure
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '502':
+          description: Authorization server returned an error on code exchange
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/mcp/oauth/{server}/status:
+    parameters:
+      - name: server
+        in: path
+        required: true
+        schema: {type: string}
+        description: MCP server name.
+    get:
+      tags: [mcp-oauth]
+      summary: Check the calling user's OAuth connection state for an MCP server
+      description: |
+        PR4c. ActiveUser-gated (bearer). Returns whether a stored token
+        exists for the (user, server) pair, the granted scopes, and the
+        token expiry. Token bytes are never exposed.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Connection status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MCPOAuthStatusResponse'}
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/mcp/oauth/{server}:
+    parameters:
+      - name: server
+        in: path
+        required: true
+        schema: {type: string}
+        description: MCP server name.
+    delete:
+      tags: [mcp-oauth]
+      summary: Revoke the calling user's stored OAuth tokens for an MCP server
+      description: |
+        PR4c. ActiveUser-gated (bearer). Deletes the stored (user, server)
+        token row. Idempotent — returns 204 even when no token was stored.
+        AS-side revocation (RFC 7009) is not called in v1 (DE filed).
+        Writes a mcp.oauth_disconnected audit row when a row was removed.
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Token deleted (or was not present)
+        '401':
+          description: Not authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
 # ============================================================
 # COMPONENTS
 # ============================================================
@@ -2823,8 +5334,731 @@ components:
         same secret is used in the reverse direction (backend → gateway)
         for incoming-request auth on the gateway's surface, though the
         gateway-side enforcement is a deferred D-phase item.
+    bridgeBearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Shared-secret bearer token the slack-bridge service presents
+        on POSTs to `/api/v1/integrations/slack/workspaces` (M3-D1).
+        Constant-time compare against `LQ_AI_BRIDGE_TOKEN` on the
+        backend. Distinct from `gatewayKeyAuth` — the bridge and the
+        gateway have separate service identities and separate
+        threat models.
 
   schemas:
+    SlackWorkspaceCreate:
+      type: object
+      description: |
+        Request body for `POST /api/v1/integrations/slack/workspaces`
+        (M3-D1). Shape matches what `slack-bridge/app/oauth.py`
+        constructs from Slack's `oauth.v2.access` response after the
+        operator completes consent. The bridge → api contract is
+        position-coupled to this shape; renames here would break it.
+      required:
+        - team_id
+        - team_name
+        - bot_token
+        - bot_user_id
+        - installer_slack_user_id
+        - scope
+      additionalProperties: false
+      properties:
+        team_id:
+          type: string
+          minLength: 1
+          description: Slack workspace id (T0...).
+          example: 'T01234567'
+        team_name:
+          type: string
+          minLength: 1
+          description: Workspace display name at install time.
+          example: 'Acme Legal'
+        bot_token:
+          type: string
+          minLength: 1
+          description: |
+            The xoxb- bot user OAuth token Slack returned. Plaintext
+            on the wire (the request travels over the trusted
+            in-cluster network with a bridge bearer token); encrypted
+            under `LQ_AI_BRIDGE_MASTER_KEY` before persistence.
+          example: 'xoxb-...'
+        bot_user_id:
+          type: string
+          minLength: 1
+          description: Slack user id of the bot user.
+          example: 'U99BOT'
+        installer_slack_user_id:
+          type: string
+          minLength: 1
+          description: Slack user id of the operator who completed install (audit only).
+          example: 'U11INSTALLER'
+        scope:
+          type: string
+          minLength: 1
+          description: Comma-separated scope list Slack returned.
+          example: 'commands,chat:write'
+
+    TeamsTenantCreate:
+      type: object
+      description: |
+        Request body for `POST /api/v1/integrations/teams/tenants`
+        (M3-D3). Shape matches what `teams-bridge/app/oauth.py`
+        constructs from the Microsoft id_token claims (`tid`, `oid`)
+        + a best-effort Microsoft Graph `/organization` display-name
+        lookup.
+      required:
+        - tenant_id
+        - tenant_name
+        - installer_oid
+      additionalProperties: false
+      properties:
+        tenant_id:
+          type: string
+          minLength: 1
+          description: Microsoft tenant id (`tid` claim — the M365 directory GUID).
+          example: '00000000-0000-0000-0000-aaaaaaaaaaaa'
+        tenant_name:
+          type: string
+          minLength: 1
+          description: |
+            Tenant display name at install time. Best-effort from
+            Microsoft Graph `/organization`; falls back to the
+            tenant_id if Graph errors.
+          example: 'Acme Legal LLP'
+        installer_oid:
+          type: string
+          minLength: 1
+          description: |
+            M365 `oid` claim of the admin who completed consent.
+            Audit only — does not grant LQ.AI permissions.
+          example: '00000000-0000-0000-0000-111111111111'
+
+    TeamsTenantResponse:
+      type: object
+      description: |
+        Persisted-tenant response for `POST
+        /api/v1/integrations/teams/tenants`. Mirrors
+        `SlackWorkspaceResponse` minus the per-tenant bot fields
+        (Teams uses app-level credentials).
+      required:
+        - id
+        - tenant_id
+        - tenant_name
+        - installer_oid
+        - installed_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: api-side tenant row id.
+        tenant_id:
+          type: string
+          example: '00000000-0000-0000-0000-aaaaaaaaaaaa'
+        tenant_name:
+          type: string
+          example: 'Acme Legal LLP'
+        installer_oid:
+          type: string
+          example: '00000000-0000-0000-0000-111111111111'
+        installed_at:
+          type: string
+          format: date-time
+          description: Original install timestamp. NOT moved by upsert.
+
+    SlackWorkspaceSummary:
+      type: object
+      description: |
+        One live Slack workspace row in the admin intake-bridges list
+        (M3-D4). The wire shape mirrors the model row minus the bot
+        token ciphertext (which the admin UI has no business seeing).
+      required:
+        - id
+        - team_id
+        - team_name
+        - installer_slack_user_id
+        - installed_at
+      properties:
+        id: { type: string, format: uuid }
+        team_id: { type: string }
+        team_name: { type: string }
+        installer_slack_user_id: { type: string }
+        installed_at: { type: string, format: date-time }
+
+    TeamsTenantSummary:
+      type: object
+      description: |
+        One live Microsoft 365 tenant row in the admin intake-bridges
+        list (M3-D4). Mirrors the model row.
+      required:
+        - id
+        - tenant_id
+        - tenant_name
+        - installer_oid
+        - installed_at
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        tenant_name: { type: string }
+        installer_oid: { type: string }
+        installed_at: { type: string, format: date-time }
+
+    IntakeBridgesList:
+      type: object
+      description: |
+        Section-split response for `GET /api/v1/admin/intake-bridges`.
+        Separate sections (rather than a single polymorphic list) so
+        the SvelteKit admin page renders two distinct sections without
+        client-side discriminator-key gymnastics.
+      required:
+        - slack_workspaces
+        - teams_tenants
+      properties:
+        slack_workspaces:
+          type: array
+          items: { $ref: '#/components/schemas/SlackWorkspaceSummary' }
+        teams_tenants:
+          type: array
+          items: { $ref: '#/components/schemas/TeamsTenantSummary' }
+
+    SlackWorkspaceResponse:
+      type: object
+      description: |
+        Persisted-workspace response for `POST
+        /api/v1/integrations/slack/workspaces`. Bot token is
+        deliberately omitted — neither the plaintext nor the
+        ciphertext is echoed back to the bridge.
+      required:
+        - id
+        - team_id
+        - team_name
+        - bot_user_id
+        - installer_slack_user_id
+        - scope
+        - installed_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: api-side workspace row id.
+        team_id:
+          type: string
+          example: 'T01234567'
+        team_name:
+          type: string
+          example: 'Acme Legal'
+        bot_user_id:
+          type: string
+          example: 'U99BOT'
+        installer_slack_user_id:
+          type: string
+          example: 'U11INSTALLER'
+        scope:
+          type: string
+          example: 'commands,chat:write'
+        installed_at:
+          type: string
+          format: date-time
+          description: Original install timestamp. NOT moved by upsert.
+
+    WordAddinVersionResponse:
+      type: object
+      description: |
+        Response payload for `GET /api/v1/word-addin/version` (M3-B8).
+        Consumed by the task pane on mount to decide whether the
+        installed add-in version is compatible with this deployment.
+      required:
+        - deployment_version
+        - addin_min_compatible_version
+        - addin_max_compatible_version
+        - taskpane_bundle_url
+      properties:
+        deployment_version:
+          type: string
+          example: '0.3.0'
+          description: |
+            LQ.AI deployment version (the api package `__version__`).
+            Informational — the add-in surfaces it in the "Update
+            needed" overlay so users can quote it to support.
+        addin_min_compatible_version:
+          type: string
+          example: '0.3.0'
+          description: |
+            Lowest add-in version (semver string) this deployment
+            accepts. The task pane refuses to render features when
+            its bundled version is lower.
+        addin_max_compatible_version:
+          type: string
+          example: '0.3.99'
+          description: |
+            Highest add-in version this deployment recognizes. Bundles
+            newer than this still load (forward compatibility is
+            best-effort) but the add-in surfaces a soft warning so the
+            operator knows to update the deployment.
+        taskpane_bundle_url:
+          type: string
+          format: uri
+          example: 'https://lq.acme.example/word-addin/taskpane.html'
+          description: |
+            Canonical URL of the task pane bundle's HTML entry point.
+        taskpane_bundle_hash:
+          type: string
+          nullable: true
+          example: null
+          description: |
+            Optional SHA-256 hash of the deployed task pane bundle JS.
+            M3-B8 ships nullable; M3-B7 signing CI populates the value.
+            Null means "don't enforce" — not an error.
+
+    FallbackTier:
+      type: object
+      required: [rank, description, language]
+      description: |
+        One acceptable alternative to a position's standard language.
+        Ranked 1-based (1 = preferred fallback). Stored as JSONB on
+        ``playbook_positions.fallback_tiers`` (M3-A1).
+      properties:
+        rank: {type: integer, minimum: 1}
+        description: {type: string}
+        language: {type: string}
+
+    Position:
+      type: object
+      required:
+        - id
+        - issue
+        - standard_language
+        - severity_if_missing
+      description: |
+        One issue in a playbook — the org's standard + fallbacks for a
+        clause. Mirrors the ``Position`` shape in PRD §3.7.
+      properties:
+        id: {type: string, format: uuid}
+        issue: {type: string}
+        description: {type: string}
+        standard_language: {type: string}
+        fallback_tiers:
+          type: array
+          items: {$ref: '#/components/schemas/FallbackTier'}
+        redline_strategy: {type: string}
+        severity_if_missing:
+          type: string
+          enum: [critical, high, medium, low]
+        detection_keywords:
+          type: array
+          items: {type: string}
+        detection_examples:
+          type: array
+          items: {type: string}
+        position_order: {type: integer, minimum: 0}
+
+    Playbook:
+      type: object
+      required: [id, name, contract_type, created_at, updated_at]
+      description: |
+        Full playbook — header plus ordered positions. Mirrors PRD §3.7.
+        ``GET /api/v1/playbooks`` returns this shape with ``positions``
+        empty; ``GET /api/v1/playbooks/{id}`` returns it with the full
+        position list inlined.
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        contract_type: {type: string}
+        description: {type: string}
+        version: {type: string}
+        created_by: {type: string, format: uuid, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        positions:
+          type: array
+          items: {$ref: '#/components/schemas/Position'}
+
+    PositionCreate:
+      type: object
+      additionalProperties: false
+      required: [issue, standard_language, severity_if_missing]
+      description: |
+        Request shape for a single position when creating or updating a
+        playbook (M3-A6). Identical to ``Position`` minus the server-
+        assigned ``id`` (the server mints UUIDs at insert time).
+      properties:
+        issue: {type: string}
+        description: {type: string}
+        standard_language: {type: string}
+        fallback_tiers:
+          type: array
+          items: {$ref: '#/components/schemas/FallbackTier'}
+        redline_strategy: {type: string}
+        severity_if_missing:
+          type: string
+          enum: [critical, high, medium, low]
+        detection_keywords:
+          type: array
+          items: {type: string}
+        detection_examples:
+          type: array
+          items: {type: string}
+        position_order: {type: integer, minimum: 0}
+
+    PlaybookCreate:
+      type: object
+      additionalProperties: false
+      required: [name, contract_type]
+      description: |
+        Request shape for ``POST /api/v1/playbooks`` (M3-A6). The server
+        sets ``created_by`` to the caller's id unconditionally; there is
+        no path to mint a built-in (``created_by IS NULL``) via the HTTP
+        surface (built-ins ship via seed migration only).
+      properties:
+        name: {type: string}
+        contract_type: {type: string}
+        description: {type: string}
+        version: {type: string}
+        positions:
+          type: array
+          items: {$ref: '#/components/schemas/PositionCreate'}
+
+    PlaybookUpdate:
+      type: object
+      additionalProperties: false
+      description: |
+        Request shape for ``PATCH /api/v1/playbooks/{id}`` (M3-A6). All
+        fields optional; a missing field is "leave alone." If
+        ``positions`` is supplied, the server **atomically replaces**
+        the entire positions list. To leave positions alone, omit the
+        field; to clear them, send ``positions: []``.
+      properties:
+        name: {type: string}
+        contract_type: {type: string}
+        description: {type: string}
+        version: {type: string}
+        positions:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/PositionCreate'}
+
+    EasyPlaybookGenerationCreate:
+      type: object
+      additionalProperties: false
+      required: [document_ids, contract_type]
+      description: |
+        Request shape for ``POST /api/v1/playbooks/easy`` (M3-A6). The
+        document corpus the wizard's Step 1 collected, plus the
+        contract family and an optional caller-supplied name.
+      properties:
+        document_ids:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: {type: string, format: uuid}
+        contract_type:
+          type: string
+          minLength: 1
+          description: |
+            The contract family the playbook targets ("NDA",
+            "MSA-SaaS", "DPA", etc.). Free-form; passed to the
+            extractor + assembly LLM calls as a hint.
+        name:
+          type: string
+          nullable: true
+          description: |
+            Playbook name. Falls back to "Generated {contract_type}
+            Playbook" if omitted.
+        persist_documents_after_generation:
+          type: boolean
+          default: true
+          description: |
+            Reserved for a future ephemeral-upload mode. Currently
+            always true; uploaded documents persist to the user's
+            library per M3-A6 §3.3.
+
+    EasyPlaybookGeneration:
+      type: object
+      required: [id, contract_type, status, document_ids, created_at]
+      description: |
+        One row from the ``easy_playbook_generations`` table. Returned
+        by ``POST /api/v1/playbooks/easy`` (at status ``pending``) and
+        by ``GET /api/v1/playbooks/easy/{id}`` (the wizard's poll
+        target). ``draft_playbook`` is populated only on
+        ``status='completed'`` and carries the assembled
+        ``PlaybookCreate`` shape for the Step 3 inline editor.
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid, nullable: true}
+        contract_type: {type: string}
+        status:
+          type: string
+          enum: [pending, running, completed, error]
+        document_ids:
+          type: array
+          items: {type: string, format: uuid}
+        draft_playbook:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: |
+            The assembled ``PlaybookCreate`` shape. ``null`` until the
+            worker reaches ``status='completed'``.
+        error_message:
+          type: string
+          nullable: true
+        created_at: {type: string, format: date-time}
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    PlaybookExecution:
+      type: object
+      required: [id, playbook_id, target_document_id, status, created_at]
+      description: |
+        One execution of a playbook against a target document.
+        Status lifecycle: ``pending → running → completed | error``.
+        ``results`` is populated on ``completed``; ``error`` is populated
+        on ``error``. ``completed_at`` is non-null in either terminal state.
+      properties:
+        id: {type: string, format: uuid}
+        playbook_id: {type: string, format: uuid}
+        target_document_id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid, nullable: true}
+        project_id: {type: string, format: uuid, nullable: true}
+        status:
+          type: string
+          enum: [pending, running, completed, error]
+        results:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: |
+            Per-position outcomes + summary. Shape is versioned via
+            ``schema_version`` (currently ``m3-a2-v1``); see the
+            M3-A2 executor module for the canonical structure.
+        error:
+          type: string
+          nullable: true
+        created_at: {type: string, format: date-time}
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    # M3-C2 — Tabular / Multi-Document Review wire shapes (PRD §3.14).
+    TabularPreviewCostRequest:
+      type: object
+      required: [document_ids]
+      description: |
+        Request body for ``POST /api/v1/tabular/preview-cost``. Either
+        ``skill_name`` or ``columns`` must be supplied (not both).
+      properties:
+        document_ids:
+          type: array
+          minItems: 1
+          items: {type: string, format: uuid}
+        skill_name:
+          type: string
+          nullable: true
+          description: Name of a registered ``output_format: table`` skill.
+        columns:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/ColumnSpec'}
+          description: Ad-hoc column spec (alternative to ``skill_name``).
+
+    TabularPreviewCostResponse:
+      type: object
+      required: [cells_count, estimated_tokens, estimated_cost_usd, per_tier_breakdown]
+      properties:
+        cells_count:
+          type: integer
+          description: ``len(document_ids) * len(columns)``.
+        estimated_tokens:
+          type: integer
+          description: Per-cell token average x cells_count.
+        estimated_cost_usd:
+          type: string
+          description: |
+            Per-cell rolling-average cost x cells_count, serialized as
+            a JSON string to preserve decimal precision.
+        per_tier_breakdown:
+          type: object
+          additionalProperties: {type: integer}
+          description: |
+            Map of tier label (``tier_1`` / ``tier_2`` / ... or
+            ``default``) to cell count routed at that tier. Columns
+            without an explicit ``minimum_inference_tier`` count in
+            the ``default`` bucket.
+        ensemble_cells_count:
+          type: integer
+          description: |
+            Number of cells that will run ensemble Citation-Engine
+            verification (``len(document_ids) * ensemble-column count``).
+            ``0`` when no column is ensemble-verified.
+        ensemble_premium_usd:
+          type: string
+          description: |
+            The ensemble judge-call cost included in
+            ``estimated_cost_usd`` (= ``n_judges * per-judge-cost *
+            ensemble_cells_count``), serialized as a JSON string to
+            preserve decimal precision. ``"0"`` when no column is
+            ensemble-verified. Note that ``estimated_cost_usd`` is the
+            TOTAL (base extraction + this premium); ``estimated_tokens``
+            is extraction-only and excludes judge tokens.
+
+    TabularExecutionCreate:
+      type: object
+      required: [document_ids]
+      description: |
+        Request body for ``POST /api/v1/tabular/execute``. Either
+        ``skill_name`` or ``columns`` must be supplied (not both).
+        ``confirmed_cost_usd`` echoes the preview value so the row
+        carries an audit trail of the operator confirming a specific
+        cost ceiling.
+      properties:
+        document_ids:
+          type: array
+          minItems: 1
+          items: {type: string, format: uuid}
+        skill_name: {type: string, nullable: true}
+        columns:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/ColumnSpec'}
+        confirmed_cost_usd:
+          type: string
+          nullable: true
+          description: |
+            Operator-confirmed cost from the preview endpoint. Persisted
+            to ``tabular_executions.cost_estimate_usd``.
+
+    TabularExecution:
+      type: object
+      required: [id, status, document_ids, document_names, columns, created_at]
+      description: |
+        One row from the ``tabular_executions`` table. Lifecycle:
+        ``pending → running → completed | failed | cancelled``.
+        ``results`` is populated by the aggregate node on ``completed``;
+        ``error_text`` is populated on ``failed``. Soft-deleted rows
+        (``deleted_at`` non-null) are invisible to list / detail
+        endpoints.
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid, nullable: true}
+        parent_execution_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            Non-null on bulk-op sibling rows (Phase C prep doc Decision
+            C-9). Bulk ops spawn siblings rather than mutating the
+            original grid, preserving auditability.
+        skill_name:
+          type: string
+          nullable: true
+          description: |
+            Source skill name; ``null`` for ad-hoc executions where the
+            operator typed columns directly in the wizard.
+        status:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+        document_ids:
+          type: array
+          items: {type: string, format: uuid}
+        document_names:
+          type: array
+          items: {type: string}
+          description: |
+            Per-document display names (operator-uploaded filenames),
+            parallel to ``document_ids`` in selection order. Assembled on
+            the response by ``_to_response``; not a stored column.
+        columns:
+          type: array
+          items: {$ref: '#/components/schemas/ColumnSpec'}
+        results:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: |
+            Assembled grid shape with rows + per-cell results. Shape is
+            versioned via ``schema_version`` (currently ``m3-c2-v1``).
+
+            Each cell result also carries ``verification_method``
+            (string, nullable) — the per-cell ensemble Citation-Engine
+            verification outcome (``ensemble_strict`` /
+            ``ensemble_majority``), or ``null`` when the cell's column is
+            not ensemble-verified or verification did not confirm support.
+
+            Each cell carries a ``citations`` array. A tabular cell
+            ``Citation`` is distinct from the chat ``Citation`` schema; it
+            has: ``citation_id`` (uuid; deterministic display-only id —
+            DE-309), ``document_id`` (uuid; the source ``documents.id``),
+            ``chunk_id`` (uuid, nullable; the cited ``document_chunks.id``),
+            and ``confidence`` (one of ``high|medium|low|failed``). Each
+            citation additionally carries ``verification_method`` (string,
+            nullable) — the Citation-Engine verification method
+            (``ensemble_strict`` / ``ensemble_majority``), or ``null`` when
+            the cell's column is not ensemble-verified or verification did
+            not confirm support. It is mirrored from the cell-level value.
+
+            On ``GET /api/v1/tabular/executions/{id}`` (only) each citation
+            is additionally enriched at read time so the frontend can open
+            the cited source in its doc panel (same UX as chat citations):
+
+            - ``source_file_id`` (uuid, nullable): the source document's
+              ``documents.file_id`` — the ``files.id`` the doc panel keys
+              off. ``null`` when the backing chunk row is missing/stale.
+            - ``source_page`` (integer, nullable): the cited chunk's
+              ``document_chunks.page_start`` (nullable — best-effort page
+              assignment).
+            - ``source_text`` (string, nullable): the cited chunk's full
+              ``document_chunks.content`` (the frontend locates/highlights
+              the cited span within it).
+
+            These three fields are resolved via two batched ``IN`` queries
+            (chunks, then documents) — no N+1 — and are ``null`` on the
+            list/export paths, which do not enrich.
+        cost_estimate_usd:
+          type: string
+          nullable: true
+        cost_actual_usd:
+          type: string
+          nullable: true
+        error_text:
+          type: string
+          nullable: true
+        created_at: {type: string, format: date-time}
+        started_at: {type: string, format: date-time, nullable: true}
+        completed_at: {type: string, format: date-time, nullable: true}
+
+    TabularExecutionSummary:
+      type: object
+      required:
+        - id
+        - status
+        - document_count
+        - column_count
+        - created_at
+      description: |
+        Compact projection used by the list endpoint. Drops the
+        (potentially large) ``results`` payload — operators fetch the
+        full execution row when they open one.
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid, nullable: true}
+        parent_execution_id: {type: string, format: uuid, nullable: true}
+        skill_name: {type: string, nullable: true}
+        status:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+        document_count: {type: integer}
+        column_count: {type: integer}
+        cost_estimate_usd: {type: string, nullable: true}
+        cost_actual_usd: {type: string, nullable: true}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time, nullable: true}
+
     AdminUserRow:
       type: object
       required: [id, email, role, is_admin, mfa_enabled, must_change_password, created_at]
@@ -2839,6 +6073,584 @@ components:
         created_at: {type: string, format: date-time}
         last_login_at: {type: string, format: date-time, nullable: true}
         deletion_scheduled_at: {type: string, format: date-time, nullable: true}
+
+    # Autonomous run findings (work-product) schemas
+
+    AutonomousFindingRead:
+      type: object
+      description: |
+        Read-only view of an ``autonomous_findings`` row — one analysis
+        finding emitted by a run via the ``emit_finding`` chokepoint.
+        ``content`` is the finding body (the LLM's ``summary``).
+        ``severity`` is LLM-emitted free text (no CHECK; ``info`` |
+        ``warn`` | ``critical`` are the intended values).
+      required:
+        - id
+        - session_id
+        - severity
+        - title
+        - content
+        - created_at
+      properties:
+        id: {type: string, format: uuid}
+        session_id: {type: string, format: uuid}
+        severity: {type: string}
+        title: {type: string}
+        content: {type: string}
+        created_at: {type: string, format: date-time}
+
+    AutonomousFindingListResponse:
+      type: object
+      description: |
+        Paginated list of a session's findings, in stable
+        ``created_at ASC, id ASC`` order — one run's rows typically
+        share ``created_at`` (transaction-stable ``now()``); ``id`` is
+        the pagination tiebreaker. Repeatable, not a guaranteed
+        emission sequence.
+      required: [findings, total_count, limit, offset]
+      properties:
+        findings:
+          type: array
+          items: {$ref: '#/components/schemas/AutonomousFindingRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    # Autonomous run artifacts (document-grade work-product, Donna #8) schemas
+
+    AutonomousArtifactRead:
+      type: object
+      description: |
+        Read-only view of an ``autonomous_artifacts`` row — a reference to
+        one document-grade artifact (a markdown memo) an opted-in run
+        persisted into its target knowledge base via the ``emit_artifact``
+        chokepoint. ``name`` and ``mime`` are LLM-emitted free text (no
+        CHECK; the ``severity`` precedent).
+      required:
+        - id
+        - name
+        - mime
+        - size_bytes
+        - created_at
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        mime: {type: string}
+        size_bytes: {type: integer, minimum: 0}
+        file_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            The backing ``files`` row. The FK is ``ON DELETE SET NULL`` —
+            null means the file was later hard-deleted; the name/size
+            metadata here survives. The KB document itself outlives the
+            session (deleting the session removes only this reference).
+        document_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            NOT a column on ``autonomous_artifacts`` — enriched at read
+            time via the unique ``documents.file_id`` (1:1) so a client
+            can deep-link the KB document. Null when ``file_id`` is null
+            or no ``documents`` row exists for the file.
+        created_at: {type: string, format: date-time}
+
+    AutonomousArtifactListResponse:
+      type: object
+      description: |
+        Paginated list of a session's artifact references, in the same
+        stable ``created_at ASC, id ASC`` order as the findings list —
+        repeatable, not a guaranteed emission sequence.
+      required: [artifacts, total_count, limit, offset]
+      properties:
+        artifacts:
+          type: array
+          items: {$ref: '#/components/schemas/AutonomousArtifactRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    # M4-B1 — Autonomous memory curation schemas
+
+    AutonomousMemoryRead:
+      type: object
+      description: |
+        Read-only view of an ``autonomous_memory`` row.  Returned by the
+        list, keep, dismiss, and delete endpoints.
+      required:
+        - id
+        - user_id
+        - state
+        - category
+        - content
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        state:
+          type: string
+          enum: [proposed, kept, dismissed]
+        category: {type: string}
+        content: {type: string}
+        source_session_id: {type: string, format: uuid, nullable: true}
+        kept_at: {type: string, format: date-time, nullable: true}
+        deleted_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    AutonomousMemoryListResponse:
+      type: object
+      description: Paginated list of autonomous memory entries (non-deleted, newest first).
+      required: [entries, total_count, limit, offset]
+      properties:
+        entries:
+          type: array
+          items: {$ref: '#/components/schemas/AutonomousMemoryRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    MemoryKeepRequest:
+      type: object
+      description: |
+        Optional request body for ``POST /autonomous/memory/{id}/keep``.
+        If ``content`` is provided, the memory entry's text is overwritten
+        on keep (edit-on-keep).
+      properties:
+        content: {type: string, nullable: true}
+
+    # M4-B2 — precedent board + promote-to-Project proposal schemas
+
+    PrecedentEntryRead:
+      type: object
+      description: |
+        Read-only view of a ``precedent_entries`` row.  Returned by the
+        list, dismiss endpoints.
+      required:
+        - id
+        - user_id
+        - pattern_kind
+        - summary
+        - observed_count
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        pattern_kind: {type: string}
+        summary: {type: string}
+        observed_count: {type: integer, minimum: 1}
+        source_session_id: {type: string, format: uuid, nullable: true}
+        dismissed_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    PrecedentEntryListResponse:
+      type: object
+      description: Paginated list of precedent entries (non-dismissed, newest first).
+      required: [entries, total_count, limit, offset]
+      properties:
+        entries:
+          type: array
+          items: {$ref: '#/components/schemas/PrecedentEntryRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    PromotePrecedentRequest:
+      type: object
+      description: |
+        Request body for ``POST /autonomous/precedents/{id}/promote``.
+        ``project_id`` is the target Project; the caller must own it.
+      required: [project_id]
+      properties:
+        project_id: {type: string, format: uuid}
+
+    ProjectContextProposalRead:
+      type: object
+      description: |
+        Read-only view of a ``project_context_proposals`` row — a proposal
+        to promote a precedent into a Project's context document.  Only the
+        user accepting a proposal writes ``projects.context_md`` (ADR 0013 D5).
+      required:
+        - id
+        - user_id
+        - precedent_id
+        - project_id
+        - suggested_md
+        - state
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        precedent_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        suggested_md: {type: string}
+        state:
+          type: string
+          enum: [proposed, accepted, rejected]
+        accepted_at: {type: string, format: date-time, nullable: true}
+        rejected_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    ProjectContextProposalListResponse:
+      type: object
+      description: Paginated list of project-context proposals (newest first).
+      required: [proposals, total_count, limit, offset]
+      properties:
+        proposals:
+          type: array
+          items: {$ref: '#/components/schemas/ProjectContextProposalRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    # M4-B3 — Scheduled-tasks schemas
+
+    AutonomousScheduleRead:
+      type: object
+      description: |
+        Read-only view of an ``autonomous_schedules`` row — a cron-triggered
+        run definition.
+      required:
+        - id
+        - user_id
+        - cron_expr
+        - enabled
+        - emit_artifacts
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid, nullable: true}
+        name: {type: string, nullable: true}
+        cron_expr: {type: string}
+        playbook_id: {type: string, format: uuid, nullable: true}
+        skill_ref: {type: string, nullable: true}
+        target_kb_id: {type: string, format: uuid, nullable: true}
+        enabled: {type: boolean}
+        emit_artifacts:
+          type: boolean
+          description: |
+            Opt-in document-grade artifact emission (Donna #8) for the
+            schedule's sessions; default off so existing automations are
+            unchanged.
+        max_cost_usd: {type: string, nullable: true}
+        last_run_at: {type: string, format: date-time, nullable: true}
+        next_run_at: {type: string, format: date-time, nullable: true}
+        deleted_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    AutonomousScheduleCreate:
+      type: object
+      description: |
+        Request body for ``POST /autonomous/schedules``.  ``cron_expr`` is a
+        five-field cron string (minute hour day-of-month month day-of-week)
+        supporting ``*``, lists, ranges, and steps; invalid expressions
+        return 422.
+      required: [cron_expr]
+      properties:
+        cron_expr: {type: string}
+        name: {type: string, nullable: true}
+        playbook_id: {type: string, format: uuid, nullable: true}
+        skill_ref: {type: string, nullable: true}
+        target_kb_id: {type: string, format: uuid, nullable: true}
+        project_id: {type: string, format: uuid, nullable: true}
+        enabled: {type: boolean, default: true}
+        emit_artifacts:
+          type: boolean
+          default: false
+          description: |
+            Opt-in document-grade artifact emission (Donna #8) for the
+            schedule's sessions; default off so existing automations are
+            unchanged.
+        max_cost_usd: {type: string, nullable: true}
+
+    AutonomousScheduleUpdate:
+      type: object
+      description: |
+        Request body for ``PATCH /autonomous/schedules/{id}``.  All fields
+        optional.  Changing ``cron_expr`` re-validates (422) and recomputes
+        ``next_run_at``.  The matter (``project_id``) may be reassigned; an
+        explicit ``null`` unassigns it, and a non-null ``project_id`` the
+        caller does not own returns 404 (id-probing-safe).
+      properties:
+        name: {type: string, nullable: true}
+        cron_expr: {type: string, nullable: true}
+        enabled: {type: boolean, nullable: true}
+        emit_artifacts:
+          type: boolean
+          nullable: true
+          description: |
+            Toggle opt-in document-grade artifact emission (Donna #8)
+            for the schedule's future sessions; omitted/null = unchanged.
+        playbook_id: {type: string, format: uuid, nullable: true}
+        skill_ref: {type: string, nullable: true}
+        target_kb_id: {type: string, format: uuid, nullable: true}
+        project_id: {type: string, format: uuid, nullable: true}
+        max_cost_usd: {type: string, nullable: true}
+
+    AutonomousManualRunRequest:
+      type: object
+      description: |
+        Request body for ``POST /autonomous/run-now``.  Spawns one
+        ``trigger_kind='manual'`` session.  Exactly one of ``playbook_id``
+        / ``skill_ref`` must be set (zero or both → 422).  ``target_kb_id``
+        / ``project_id`` are optional scope.  ``max_cost_usd`` is the
+        per-run cap (NULL → fall back to the config default).  A manual
+        run has no schedule/watch row to inherit ``emit_artifacts`` from,
+        so this body IS the opt-in source.
+      properties:
+        playbook_id: {type: string, format: uuid, nullable: true}
+        skill_ref: {type: string, nullable: true}
+        target_kb_id: {type: string, format: uuid, nullable: true}
+        project_id: {type: string, format: uuid, nullable: true}
+        max_cost_usd: {type: string, nullable: true}
+        emit_artifacts:
+          type: boolean
+          default: false
+          description: |
+            Opt-in document-grade artifact emission (Donna #8) for this
+            one-off run; default off so existing callers are unchanged.
+
+    AutonomousScheduleListResponse:
+      type: object
+      description: Paginated list of autonomous schedules (newest first).
+      required: [schedules, total_count, limit, offset]
+      properties:
+        schedules:
+          type: array
+          items: {$ref: '#/components/schemas/AutonomousScheduleRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    # M4-B4 — KB-arrival watch schemas
+
+    AutonomousWatchRead:
+      type: object
+      description: |
+        Read-only view of an ``autonomous_watches`` row — a KB-arrival-
+        triggered run definition. When a file is attached to
+        ``knowledge_base_id``, an autonomous session spawns.
+      required:
+        - id
+        - user_id
+        - knowledge_base_id
+        - enabled
+        - emit_artifacts
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid, nullable: true}
+        knowledge_base_id: {type: string, format: uuid}
+        playbook_id: {type: string, format: uuid, nullable: true}
+        skill_ref: {type: string, nullable: true}
+        enabled: {type: boolean}
+        emit_artifacts:
+          type: boolean
+          description: |
+            Opt-in document-grade artifact emission (Donna #8) for the
+            watch's sessions; default off so existing automations are
+            unchanged.
+        max_cost_usd: {type: string, nullable: true}
+        deleted_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    AutonomousWatchCreate:
+      type: object
+      description: |
+        Request body for ``POST /autonomous/watches``.  ``knowledge_base_id``
+        is required and must be owned by the caller (404 otherwise; KB-sharing
+        is out of scope).  The target (``playbook_id`` / ``skill_ref``) and
+        ``project_id`` are optional; ``enabled`` defaults to true.
+      required: [knowledge_base_id]
+      properties:
+        knowledge_base_id: {type: string, format: uuid}
+        playbook_id: {type: string, format: uuid, nullable: true}
+        skill_ref: {type: string, nullable: true}
+        project_id: {type: string, format: uuid, nullable: true}
+        enabled: {type: boolean, default: true}
+        emit_artifacts:
+          type: boolean
+          default: false
+          description: |
+            Opt-in document-grade artifact emission (Donna #8) for the
+            watch's sessions; default off so existing automations are
+            unchanged.
+        max_cost_usd: {type: string, nullable: true}
+
+    AutonomousWatchUpdate:
+      type: object
+      description: |
+        Request body for ``PATCH /autonomous/watches/{id}``.  All fields
+        optional.  The watch's ``knowledge_base_id`` is immutable (not
+        present here) — a watch is bound to its KB.  The matter
+        (``project_id``) may be reassigned; an explicit ``null`` unassigns
+        it, and a non-null ``project_id`` the caller does not own returns
+        404 (id-probing-safe).
+      properties:
+        enabled: {type: boolean, nullable: true}
+        emit_artifacts:
+          type: boolean
+          nullable: true
+          description: |
+            Toggle opt-in document-grade artifact emission (Donna #8)
+            for the watch's future sessions; omitted/null = unchanged.
+        playbook_id: {type: string, format: uuid, nullable: true}
+        skill_ref: {type: string, nullable: true}
+        project_id: {type: string, format: uuid, nullable: true}
+        max_cost_usd: {type: string, nullable: true}
+
+    AutonomousWatchListResponse:
+      type: object
+      description: Paginated list of autonomous watches (newest first).
+      required: [watches, total_count, limit, offset]
+      properties:
+        watches:
+          type: array
+          items: {$ref: '#/components/schemas/AutonomousWatchRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    # M4-C1 — Autonomous notification read/dismiss schemas
+
+    AutonomousNotificationRead:
+      type: object
+      description: |
+        Read-only view of an ``autonomous_notifications`` row. Written by
+        the ``notify`` chokepoint handler. ``read_at`` IS NULL = unread;
+        marking read is the dismiss action. ``channel`` is one of
+        ``in_app`` / ``email`` / ``webhook`` (``webhook`` reserved).
+        ``body``/``payload`` carry counts/IDs + a receipt link — never raw
+        entity values. A run-completion notification's ``payload`` carries
+        ``finding_count`` and ``artifact_count`` (``artifact_count`` is 0
+        unless the run opted in via ``emit_artifacts``).
+      required:
+        - id
+        - user_id
+        - session_id
+        - channel
+        - title
+        - body
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        session_id: {type: string, format: uuid}
+        channel: {type: string, enum: [in_app, email, webhook]}
+        title: {type: string}
+        body: {type: string}
+        payload: {type: object, nullable: true, additionalProperties: true}
+        read_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    AutonomousNotificationListResponse:
+      type: object
+      description: Paginated list of autonomous notifications (newest first).
+      required: [notifications, total_count, limit, offset]
+      properties:
+        notifications:
+          type: array
+          items: {$ref: '#/components/schemas/AutonomousNotificationRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    # M4-A4-i — Autonomous session response schemas
+
+    AutonomousSessionRead:
+      type: object
+      description: |
+        Read-only view of an ``autonomous_sessions`` row.  Returned by the
+        halt, list, and detail endpoints.
+      required:
+        - id
+        - user_id
+        - trigger_kind
+        - current_phase
+        - halt_state
+        - cost_total_usd
+        - cost_cap_reached
+        - idle_halt_minutes
+        - last_activity_at
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid, nullable: true}
+        trigger_kind:
+          type: string
+          enum: [watch, schedule, suggestion, manual]
+        trigger_ref: {type: string, format: uuid, nullable: true}
+        current_phase:
+          type: string
+          enum: [intake, analysis, drafting, ethics_review, delivery]
+        halt_state:
+          type: string
+          enum: [running, halt_requested, halted, paused]
+        max_cost_usd: {type: string, nullable: true}
+        cost_total_usd: {type: string}
+        cost_cap_reached: {type: boolean}
+        idle_halt_minutes: {type: integer, minimum: 1}
+        last_activity_at: {type: string, format: date-time}
+        status:
+          type: string
+          enum: [running, completed, halted, failed]
+        params: {type: object, additionalProperties: true}
+        result: {type: object, additionalProperties: true, nullable: true}
+        error: {type: string, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time, nullable: true}
+
+    AutonomousSessionListResponse:
+      type: object
+      description: Paginated list of autonomous sessions (newest first).
+      required: [sessions, total_count, limit, offset]
+      properties:
+        sessions:
+          type: array
+          items: {$ref: '#/components/schemas/AutonomousSessionRead'}
+        total_count: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 200}
+        offset: {type: integer, minimum: 0}
+
+    AutonomousSessionDetailResponse:
+      type: object
+      description: |
+        Session detail view with live-reconstructed receipt.
+        The receipt is built from audit rows on every request and contains
+        phase transitions, tool calls, terminal reason, and session metadata.
+        No raw document text or entity values are included.
+      required: [session, receipt]
+      properties:
+        session:
+          $ref: '#/components/schemas/AutonomousSessionRead'
+        receipt:
+          type: object
+          additionalProperties: true
+          description: |
+            Audit-derived receipt: session_id, trigger_kind, status,
+            halt_state, current_phase, cost_total_usd, max_cost_usd,
+            cost_cap_reached, created_at, completed_at,
+            phase_transitions (list), tool_calls (list),
+            terminal_reason (string | null).
 
     AdminUserListResponse:
       type: object
@@ -2984,13 +6796,17 @@ components:
             by default) vs. ``collapsed`` (hidden until expanded).
         created_at: {type: string, format: date-time}
         last_login_at: {type: string, format: date-time, nullable: true}
+        deletion_scheduled_at:
+          {type: string, format: date-time, nullable: true,
+           description: "Non-null while a GDPR Article 17 grace-period deletion is pending (set by POST /users/me/delete, cleared by .../delete/cancel)."}
 
     UserPreferences:
       type: object
       description: |
-        All 5 personalization preference fields. Wave A (``reasoning_visibility``)
-        per PRD §3.2; Wave B v2 fields per PRD §3.2.1 and frontend spec §4.3.
-      required: [reasoning_visibility, featured_tools, workspace_layout, trust_pills, provenance_pills]
+        All 6 personalization preference fields. Wave A (``reasoning_visibility``)
+        per PRD §3.2; Wave B v2 fields per PRD §3.2.1 and frontend spec §4.3;
+        ``autonomous_enabled`` per PRD §5 / M4-C2.
+      required: [reasoning_visibility, featured_tools, workspace_layout, trust_pills, provenance_pills, autonomous_enabled]
       properties:
         reasoning_visibility:
           type: string
@@ -3012,12 +6828,15 @@ components:
           type: string
           enum: [always, collapsed]
           default: always
+        autonomous_enabled:
+          type: boolean
 
     UserPreferencesUpdate:
       type: object
       description: |
         All fields optional; only supplied keys are updated. Wave B v2 adds
-        four personalization fields per PRD §3.2.1 and frontend spec §4.3.
+        four personalization fields per PRD §3.2.1 and frontend spec §4.3;
+        ``autonomous_enabled`` per PRD §5 / M4-C2.
       properties:
         reasoning_visibility:
           type: string
@@ -3034,6 +6853,29 @@ components:
         provenance_pills:
           type: string
           enum: [always, collapsed]
+        autonomous_enabled:
+          type: boolean
+
+    UserProfileUpdate:
+      type: object
+      description: |
+        PATCH body for `/api/v1/users/me`. Caller-scoped self-edit of the
+        user's own profile. Currently `display_name` only: when supplied
+        it is trimmed and must be non-empty after trimming. At least one
+        updatable field must be present (an all-omitted body is a 422).
+
+        Email self-service editing is intentionally out of scope here —
+        changing the login email pulls in re-verification, MFA, and
+        uniqueness concerns and is deferred to a dedicated flow.
+      properties:
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: |
+            New display name. Trimmed server-side; must be non-empty after
+            trimming. Omit to leave unchanged (but at least one field must
+            be present, so an empty body is rejected).
 
     Project:
       type: object
@@ -3263,6 +7105,31 @@ components:
             that the skill's frontmatter declares but the bindings
             don't provide cause a 400 with `code=skill_input_missing`.
 
+            Values are plain scalars interpolated into the skill body via
+            `{{name}}` substitution (ADR 0006). There is NO `type:"file"`
+            binding: passing a file UUID here interpolates the literal
+            UUID string, not the file's document text. For per-turn
+            document context use the separate `file_ids` channel below —
+            `skill_inputs` and `file_ids` are distinct; a `file_id` is
+            NOT bindable to a skill file-input via `skill_inputs`.
+        file_ids:
+          type: array
+          maxItems: 16
+          items: {type: string, format: uuid}
+          description: |
+            Donna: caller-owned file UUIDs supplying ephemeral,
+            per-message document context for this one chat turn.
+            Distinct from KB attach (project-scoped, persistent) and
+            from `skill_inputs` (scalar skill params — see the note
+            above; no `type:"file"` binding is wired). Each id is
+            validated server-side to exist and be owned by the caller;
+            a foreign, unknown, or soft-deleted id returns 404
+            (id-probing-safe — indistinguishable from "not found").
+            Validated ids are forwarded to the gateway as `lq_ai_file_ids`
+            alongside `lq_ai_skills` and echoed back as `applied_file_ids`
+            on the response / SSE `complete` frame. Capped at 16 entries.
+            Omitted / empty is back-compatible.
+
     MessagePostResponse:
       type: object
       required: [message, citations]
@@ -3299,6 +7166,17 @@ components:
           description: |
             C2: skills that were successfully assembled into the prompt
             for this request. Empty when no skills were attached.
+        applied_file_ids:
+          type: array
+          items: {type: string, format: uuid}
+          description: |
+            Donna: caller-owned file ids that were validated and
+            forwarded to the gateway as `lq_ai_file_ids` for this turn —
+            the echo of `MessageCreate.file_ids` (mirrors
+            `applied_skills`). Turn-scoped: there is no
+            `messages.file_ids` column, so this surfaces only on the send
+            response (and the SSE `complete` frame), not on rows read
+            back via `GET /chats/{id}/messages`. Empty when none attached.
 
     MessageStreamEvent:
       oneOf:
@@ -3366,6 +7244,14 @@ components:
           description: |
             C2: skills that were successfully assembled into the prompt
             for this request. Empty when no skills were attached.
+        applied_file_ids:
+          type: array
+          items: {type: string, format: uuid}
+          description: |
+            Donna: caller-owned file ids forwarded to the gateway as
+            `lq_ai_file_ids` for this turn — the echo of
+            `MessageCreate.file_ids` (mirrors `applied_skills`).
+            Turn-scoped; not persisted. Empty when none attached.
         routed_inference_tier:
           type: integer
           enum: [1,2,3,4,5]
@@ -3410,6 +7296,12 @@ components:
         scope: {type: string, enum: [builtin, user, team]}
         title: {type: string}
         description: {type: string}
+        author:
+          type: string
+          description: >-
+            Attribution string from the skill's ``lq_ai.author`` frontmatter
+            (DE-316). Surfaced verbatim; absent when the frontmatter omits it.
+            Read by the gateway's ``skill.execute`` OTel span as ``skill.author``.
         tags: {type: array, items: {type: string}}
         jurisdiction:
           type: string
@@ -3429,6 +7321,36 @@ components:
           description: >-
             Skill's documented output format (e.g., ``report``, ``markdown``,
             ``structured_checklist``, ``redline``). Free-form per the corpus.
+
+    # M3-C1 — column definition for output_format: table skills.
+    ColumnSpec:
+      type: object
+      required: [name, query]
+      description: >-
+        One column in an ``output_format: table`` skill (M3-C1). The
+        Tabular Review workflow (M3-C2) runs each ``(document, column)``
+        cell as a Citation-Engine-grounded extraction.
+      properties:
+        name: {type: string, description: "Grid column header."}
+        query:
+          type: string
+          description: >-
+            Per-row extraction prompt instantiated against each document.
+        ensemble_verification:
+          type: boolean
+          nullable: true
+          description: >-
+            Per-column override of the skill-level ``ensemble_verification``
+            field. ``true`` routes this column's cells through Stage 4 of
+            the Citation Engine cascade.
+        minimum_inference_tier:
+          type: integer
+          minimum: 1
+          maximum: 5
+          nullable: true
+          description: >-
+            Per-column override of the skill-level tier floor. High-stakes
+            columns can demand Tier 4+ while routine columns route Tier 1.
 
     Skill:
       allOf:
@@ -3466,6 +7388,16 @@ components:
                 properties:
                   path: {type: string}
                   content: {type: string}
+            columns:
+              type: array
+              nullable: true
+              description: >-
+                M3-C1 — column definitions for ``output_format: table``
+                skills. ``null`` for non-table skills. The validator
+                rejects ``output_format: table`` skills that lack a
+                non-empty ``columns`` list at load time.
+              items:
+                $ref: '#/components/schemas/ColumnSpec'
 
     # Wave A — Skill inputs (form schema for the skill-input-form pattern).
     SkillInputDef:
@@ -3682,6 +7614,16 @@ components:
             `ingestion_status='ready'`; counts characters of the
             canonical PyMuPDF-extracted text, not of the original
             PDF byte stream.
+        document_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            UUID of the parsed-content `documents` row (M3-A6 Phase 6).
+            Distinct from `id` (the File UUID). `null` until the C5
+            parse pipeline produces the row; the Easy Playbook wizard
+            polls `GET /files/{id}` until this flips non-null, then
+            passes the value to `POST /playbooks/easy` in `document_ids`.
         created_at: {type: string, format: date-time}
 
     KnowledgeBase:
@@ -3756,6 +7698,16 @@ components:
           nullable: true
         page_count: {type: integer, nullable: true}
         character_count: {type: integer, nullable: true}
+        document_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            The parsed-content `documents` row UUID, distinct from `id`
+            (the File UUID). Null until the C5 parse pipeline produces
+            a documents row. Added in M3-A4 so playbook-execute callers
+            can resolve File → Document client-side without a second
+            fetch.
         created_at: {type: string, format: date-time}
         attached_at:
           type: string
@@ -4074,6 +8026,154 @@ components:
         fallback:
           type: array
           items: {$ref: '#/components/schemas/AdminAliasFallback'}
+
+    # Donna #7 — runtime provider-key (BYOK) proxy. These mirror the
+    # gateway's ProviderKey* schemas; the backend forwards the JSON
+    # verbatim and never returns the secret (the status carries at most
+    # the last 4 characters of a resolved key).
+    ProviderKeySetRequest:
+      type: object
+      required: [provider, api_key]
+      properties:
+        provider:
+          type: string
+          minLength: 1
+          description: Name of an already-configured provider entry.
+        api_key:
+          type: string
+          minLength: 1
+          description: |
+            Plaintext provider key. The gateway encrypts it with the
+            gateway master key before it touches disk; it is never echoed
+            back in any response.
+
+    ProviderKeyRotateRequest:
+      type: object
+      required: [api_key]
+      properties:
+        api_key:
+          type: string
+          minLength: 1
+          description: |
+            Replacement plaintext provider key. Same handling as
+            ProviderKeySetRequest.api_key.
+
+    MCPToolView:
+      type: object
+      required: [name, read_only, destructive, requires_confirmation, enabled]
+      properties:
+        name: {type: string}
+        description: {type: string, nullable: true}
+        parameters: {type: object, additionalProperties: true}
+        read_only: {type: boolean}
+        destructive: {type: boolean}
+        requires_confirmation: {type: boolean}
+        enabled: {type: boolean}
+
+    MCPServerView:
+      type: object
+      required: [name, type, tools]
+      properties:
+        name: {type: string}
+        type: {type: string}
+        tools:
+          type: array
+          items: {$ref: '#/components/schemas/MCPToolView'}
+
+    MCPServersResponse:
+      type: object
+      required: [servers]
+      properties:
+        servers:
+          type: array
+          items: {$ref: '#/components/schemas/MCPServerView'}
+
+    MCPRefreshResponse:
+      type: object
+      required: [server, tools]
+      properties:
+        server: {type: string}
+        tools:
+          type: array
+          items: {$ref: '#/components/schemas/MCPToolView'}
+
+    MCPToolEnableRequest:
+      type: object
+      required: [enabled]
+      additionalProperties: false
+      properties:
+        enabled: {type: boolean}
+
+    MCPOAuthCallbackResponse:
+      type: object
+      required: [connected, server, scopes]
+      properties:
+        connected: {type: boolean}
+        server: {type: string}
+        scopes:
+          type: array
+          items: {type: string}
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    MCPOAuthStatusResponse:
+      type: object
+      required: [connected, scopes]
+      properties:
+        connected: {type: boolean}
+        scopes:
+          type: array
+          items: {type: string}
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    ProviderKeyStatus:
+      type: object
+      required: [provider, type, configured, last4, source]
+      description: |
+        Secret-safe status for one provider. Carries at most the last 4
+        characters of the resolved key — never the full key or token.
+      properties:
+        provider: {type: string}
+        type:
+          type: string
+          nullable: true
+          description: |
+            The provider's adapter type. Null only in the rare race where a
+            provider is removed between the write and the status read-back on
+            a single-provider (POST/PATCH) response; never null on the list.
+        configured:
+          type: boolean
+          description: |
+            True when the provider has a live, routable adapter (its key
+            resolved). A keyless or unresolvable provider is false.
+        last4:
+          type: string
+          nullable: true
+          minLength: 4
+          maxLength: 4
+          description: |
+            Last 4 characters of the resolved key, or null when the key is
+            absent, unresolvable, or shorter than 4 characters.
+        source:
+          type: string
+          nullable: true
+          enum: [env, runtime, null]
+          description: |
+            Key source: `runtime` (encrypted-at-rest in gateway.yaml),
+            `env` (api_key_env), or null (no key configured).
+
+    ProviderKeyList:
+      type: object
+      required: [provider_keys]
+      properties:
+        provider_keys:
+          type: array
+          items: {$ref: '#/components/schemas/ProviderKeyStatus'}
 
     Error:
       type: object

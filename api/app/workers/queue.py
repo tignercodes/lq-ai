@@ -44,7 +44,45 @@ EXPORT_USER_DATA_JOB_NAME = "export_user_data_job"
 calls ``POST /api/v1/users/me/export``; the worker assembles the ZIP
 and writes it to MinIO under ``exports/<user_id>/<job_id>.zip``."""
 
+EASY_PLAYBOOK_JOB_NAME = "easy_playbook_generation_job"
+"""M3-A6 Phase 5 — Easy Playbook generation pipeline. Triggered by
+the API when a user calls ``POST /api/v1/playbooks/easy``; the
+playbook worker (see :mod:`app.workers.arq_setup`) consumes from the
+shared playbook queue, walks the document corpus, and writes the
+assembled draft playbook back to the ``easy_playbook_generations`` row."""
+
+AUTONOMOUS_SESSION_JOB_NAME = "autonomous_session_job"
+"""M4-A2 / M4-B3 — Autonomous Session execution pipeline. Enqueued by the
+B3 schedule dispatcher (and future watch/manual triggers) onto the shared
+playbook queue; the playbook worker consumes it and runs the session via
+the LangGraph executor under the brakes. Must match
+:data:`app.workers.autonomous_worker.AUTONOMOUS_SESSION_JOB_NAME`."""
+
+TABULAR_JOB_NAME = "tabular_execution_job"
+"""M3-C2 — Tabular Review execution pipeline. Triggered by the API
+when a user calls ``POST /api/v1/tabular/execute``; the playbook
+worker consumes from the same shared queue as Easy Playbook (per
+Decision C-3) and walks the documents x columns grid via the
+LangGraph executor."""
+
+M3_PLAYBOOK_QUEUE_NAME = "arq:m3a6"
+"""Mirror of :data:`app.workers.arq_setup.M3_PLAYBOOK_QUEUE_NAME` (kept
+here to avoid a circular import). Must stay in sync; a discrepancy
+would queue jobs that the worker never sees. Queue string stays
+``arq:m3a6`` for on-the-wire compatibility — only the Python constant
+was renamed."""
+
+M3A6_QUEUE_NAME = M3_PLAYBOOK_QUEUE_NAME
+"""Backward-compat alias for the renamed :data:`M3_PLAYBOOK_QUEUE_NAME`.
+Will be removed in a future release; new code should use
+:data:`M3_PLAYBOOK_QUEUE_NAME`."""
+
 _pool: Any = None
+_m3a6_pool: Any = None
+"""Separate pool whose ``default_queue_name`` targets the M3-A6 queue.
+Keeps the api-side enqueue path symmetric with the worker side: jobs
+the api enqueues onto this pool land on the queue the M3-A6 worker is
+consuming from."""
 
 
 async def _get_pool() -> Any:
@@ -72,17 +110,47 @@ async def _get_pool() -> Any:
 
 
 async def close_pool() -> None:
-    """Close the cached arq Redis pool. Idempotent."""
+    """Close the cached arq Redis pool(s). Idempotent.
 
-    global _pool
-    if _pool is None:
-        return
-    try:
-        await _pool.aclose()
-    except Exception as exc:  # pragma: no cover - shutdown best-effort
-        log.warning("close_pool: arq pool close failed: %s", exc)
-    finally:
-        _pool = None
+    Closes both the default-queue pool (ingest path) and the M3-A6
+    pool (easy-playbook path) so an FastAPI shutdown handler that
+    calls this leaves no orphan connections.
+    """
+
+    global _pool, _m3a6_pool
+    for name, pool in (("default", _pool), ("m3a6", _m3a6_pool)):
+        if pool is None:
+            continue
+        try:
+            await pool.aclose()
+        except Exception as exc:  # pragma: no cover - shutdown best-effort
+            log.warning("close_pool: arq %s pool close failed: %s", name, exc)
+    _pool = None
+    _m3a6_pool = None
+
+
+async def _get_m3a6_pool() -> Any:
+    """Return a cached arq Redis pool whose default queue is ``arq:m3a6``.
+
+    Separate from :func:`_get_pool` so the api process can enqueue onto
+    either queue without specifying ``_queue_name`` per call. Lazy
+    import of ``arq`` so the api imports cleanly in test environments
+    where arq is mocked.
+    """
+
+    global _m3a6_pool
+    if _m3a6_pool is not None:
+        return _m3a6_pool
+
+    from arq import create_pool
+    from arq.connections import RedisSettings
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    redis_settings = RedisSettings.from_dsn(settings.redis_url)
+    _m3a6_pool = await create_pool(redis_settings, default_queue_name=M3_PLAYBOOK_QUEUE_NAME)
+    return _m3a6_pool
 
 
 async def enqueue_ingest_job(file_id: uuid.UUID) -> bool:
@@ -135,6 +203,112 @@ async def enqueue_embed_job(file_id: uuid.UUID) -> bool:
             extra={
                 "event": "embed_enqueue_failed",
                 "file_id": str(file_id),
+                "error": str(exc),
+            },
+        )
+        return False
+
+
+async def enqueue_easy_playbook_generation_job(generation_id: uuid.UUID) -> bool:
+    """Enqueue an Easy Playbook generation job onto the shared playbook queue.
+
+    Returns True on success, False on transport / import failure
+    (matching the other ``enqueue_*`` helpers' best-effort posture).
+    The POST handler logs at WARNING on failure but does NOT roll back
+    the row — the wizard's UI polls the generation row regardless, and
+    an operator can re-enqueue manually if needed.
+    """
+
+    try:
+        pool = await _get_m3a6_pool()
+        await pool.enqueue_job(EASY_PLAYBOOK_JOB_NAME, str(generation_id))
+        log.info(
+            "enqueue_easy_playbook_generation_job: enqueued",
+            extra={
+                "event": "easy_playbook_enqueue",
+                "generation_id": str(generation_id),
+            },
+        )
+        return True
+    except Exception as exc:
+        log.warning(
+            "enqueue_easy_playbook_generation_job: failed; row stays pending",
+            extra={
+                "event": "easy_playbook_enqueue_failed",
+                "generation_id": str(generation_id),
+                "error": str(exc),
+            },
+        )
+        return False
+
+
+async def enqueue_tabular_execution_job(execution_id: uuid.UUID) -> bool:
+    """Enqueue a Tabular Review execution job onto the shared playbook queue.
+
+    Shares the M3-A6-original queue with Easy Playbook per Decision C-3
+    (one shared worker container for both long-running playbook /
+    tabular workloads).
+
+    Returns True on success, False on transport / import failure. The
+    POST handler logs at WARNING on failure but does NOT roll back
+    the row — the result-view polls regardless, and an operator can
+    re-enqueue manually if the row is stuck at ``pending``.
+    """
+
+    try:
+        pool = await _get_m3a6_pool()
+        await pool.enqueue_job(TABULAR_JOB_NAME, str(execution_id))
+        log.info(
+            "enqueue_tabular_execution_job: enqueued",
+            extra={
+                "event": "tabular_execution_enqueue",
+                "execution_id": str(execution_id),
+            },
+        )
+        return True
+    except Exception as exc:
+        log.warning(
+            "enqueue_tabular_execution_job: failed; row stays pending",
+            extra={
+                "event": "tabular_execution_enqueue_failed",
+                "execution_id": str(execution_id),
+                "error": str(exc),
+            },
+        )
+        return False
+
+
+async def enqueue_autonomous_session_job(session_id: uuid.UUID) -> bool:
+    """Enqueue an Autonomous Session job onto the shared playbook queue.
+
+    Shares the M3-A6-original queue with Easy Playbook + Tabular (per
+    Decision C-3 and the autonomous-worker queue note). Triggered by the
+    B3 schedule dispatcher (and future watch/manual triggers) after the
+    :class:`~app.models.autonomous.AutonomousSession` row is flushed.
+
+    Returns True on success, False on transport / import failure
+    (best-effort posture matching the other ``enqueue_*`` helpers). The
+    caller logs at WARNING on failure but does NOT roll back the row — an
+    operator can re-enqueue a stuck ``running`` session manually.
+    """
+
+    try:
+        pool = await _get_m3a6_pool()
+        await pool.enqueue_job(AUTONOMOUS_SESSION_JOB_NAME, str(session_id))
+        log.info(
+            "enqueue_autonomous_session_job: enqueued",
+            extra={
+                "event": "autonomous_session_enqueue",
+                "session_id": str(session_id),
+            },
+        )
+        return True
+    except Exception as exc:
+        log.warning(
+            "enqueue_autonomous_session_job: failed; session stays running",
+            extra={
+                "event": "autonomous_session_enqueue_failed",
+                "session_id": str(session_id),
                 "error": str(exc),
             },
         )
