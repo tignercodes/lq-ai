@@ -1,4 +1,4 @@
-be # Skill-Authoring Guide
+# Skill-Authoring Guide
 
 This guide documents the conventions for authoring high-quality skills in LQ.AI. It is a working document — the conventions are derived from the patterns established in the M1 starter skills, and they will refine as the skill library grows. Contributions to this guide via PR are welcome.
 
